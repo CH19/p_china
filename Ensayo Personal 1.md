@@ -108,8 +108,3 @@ Los números de MASS2221 cuadran, y acepto la evidencia sobre el sanity cap. Dos
 3. El "3 CBM fijos" para SKUs sin datos suficientes no tiene justificación — derívalo de algo (ej. promedio de CBM de SKUs similares) en vez de un número fijo arbitrario.
 
 Con esos 3 puntos resueltos, aprueba para implementar.
-
-Se quedó sin [mensajes](https://support.claude.com/en/articles/11647753-understanding-usage-and-length-limits) gratuitos hasta 1:50 p.m.
-
-[Claude es IA y puede cometer errores. Por favor, verifica nuevamente las respuestas.](https://support.anthropic.com/en/articles/8525154-claude-is-providing-incorrect-or-misleading-responses-what-s-going-on)
-

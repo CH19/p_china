@@ -338,20 +338,24 @@ def cargar_datos_base():
 
 df_trans, df_art, df_metadata, df_info_prod, df_stock_transito, df_p2p = cargar_datos_base()
 
+# Excluir de forma global y permanente el SKU MASS1350 de todo el sistema
+df_trans = df_trans[df_trans['sku'] != 'MASS1350']
+df_art = df_art[df_art['sku'] != 'MASS1350']
+
 # ══════════════════════════════════════════════════════════════════════════════
 # 3. SIDEBAR CORPORATIVO MASSHOPPING
 # ══════════════════════════════════════════════════════════════════════════════
 with st.sidebar:
     if os.path.exists("Masshoping_logo.png"):
         st.image("Masshoping_logo.png", width=170)
-    st.markdown("### Motor de logistica para compras masivas")
-    st.caption("Panel de Control y Compras Estrategicas")
+    st.markdown("### Motor de logística para compras masivas")
+    st.caption("Panel de Control y Compras Estratégicas")
     st.divider()
     
     st.subheader("Ventana Temporal de Demanda")
     opcion_tiempo = st.selectbox(
-        "Periodo analizado:",
-        ["Todo el historial (1 anio)", "Ultimos 6 meses (Recomendado)", "Ultimos 3 meses"],
+        "Período analizado:",
+        ["Último Año", "Últimos 6 meses", "Últimos 3 meses"],
         key="sidebar_periodo"
     )
     
@@ -366,7 +370,7 @@ with st.sidebar:
         df_trans_filtrada = df_trans.copy()
     
     st.divider()
-    st.subheader("Parametros del Contenedor")
+    st.subheader("Parámetros del Contenedor")
     capacidad_cont = st.number_input("Capacidad Contenedor 40HQ (CBM):", value=68.0, step=1.0)
     flete_cbm = st.number_input("Flete por CBM (USD):", value=500.0, step=5.0)
     lead_time = st.slider("Lead Time Proveedor (Semanas):", min_value=1, max_value=30, value=15)
@@ -483,10 +487,7 @@ st.markdown("""
 <div class="masshopping-header">
     <div>
         <div class="masshopping-title">MASSHOPPING | Portal de Administracion y Planificacion Logistica</div>
-        <div class="masshopping-subtitle">Control de Inventarios - Clasificacion ABC-XYZ - Simulacion y Consolidacion de Contenedores 40HQ</div>
-    </div>
-    <div>
-        <span class="badge-brand">Sistema Central</span>
+        <div class="masshopping-subtitle">Control de Inventarios - Clasificacion ABC-XYZ </div>
     </div>
 </div>
 """, unsafe_allow_html=True)
@@ -514,10 +515,12 @@ with tab1:
     with st.container():
         r1_col1, r1_col2 = st.columns([2.5, 1.5])
         with r1_col1:
-            busqueda_texto = st.text_input(
-                "Buscar producto por Codigo SKU o Descripcion:",
-                placeholder="Escribe codigo (ej: MASS2603) o palabra (ej: Estante, Cargador, Cable...)",
-                key="input_busqueda_sku"
+            etiquetas_opciones_t1 = (df_modelo['sku'] + " -- " + df_modelo['nombre']).tolist()
+            busqueda_skus = st.multiselect(
+                "Buscar producto por Codigo SKU o Descripcion (Autocompletado):",
+                options=etiquetas_opciones_t1,
+                placeholder="Escribe codigo o palabra para buscar...",
+                key="multiselect_busqueda_sku_t1"
             )
         with r1_col2:
             todas_categorias = sorted(df_modelo['categoria'].unique().tolist())
@@ -546,17 +549,20 @@ with tab1:
     if f_categoria:
         mask = mask & (df_modelo['categoria'].isin(f_categoria))
         
-    if busqueda_texto:
-        texto = busqueda_texto.strip()
-        mask = mask & (
-            df_modelo['sku'].str.contains(texto, case=False, na=False) |
-            df_modelo['nombre'].str.contains(texto, case=False, na=False)
-        )
+    if busqueda_skus:
+        codigos_buscar = [s.split(" -- ")[0] for s in busqueda_skus]
+        mask = mask & (df_modelo['sku'].isin(codigos_buscar))
     
     df_vista = df_modelo[mask].copy()
     
     st.caption(f"Mostrando **{len(df_vista):,}** productos de {len(df_modelo):,} totales.")
     
+    seleccionar_todos = st.checkbox("Marcar todos los productos mostrados para incluirlos en el pedido")
+    if seleccionar_todos:
+        df_vista['incluir_en_pedido'] = True
+    else:
+        df_vista['incluir_en_pedido'] = False
+        
     # Tabla editable
     cols_editor = [
         'incluir_en_pedido', 'imagen_url', 'sku', 'nombre', 'categoria', 'clase_abc_xyz',
@@ -609,7 +615,6 @@ with tab1:
         <div class="metric-box">
             <div class="metric-label">Volumen Total CBM</div>
             <div class="metric-value">{cbm_acumulado:,.2f} m3</div>
-            <div class="metric-delta">Capacidad 40HQ: {capacidad_cont:,.0f} m3</div>
         </div>
         """, unsafe_allow_html=True)
     with m_col2:
@@ -1148,7 +1153,7 @@ with tab6:
 # ══════════════════════════════════════════════════════════════════════════════
 with tab7:
     st.subheader("Generador Automatico de Pedido Optimo")
-    st.info("Este generador selecciona EXCLUSIVAMENTE productos Clase AA o A, que NO tienen stock en transito, y cuyo stock actual ha caido por debajo del Punto de Reorden (ROP).")
+    st.info("Este generador selecciona EXCLUSIVAMENTE productos Clase AA o A, que NO tienen stock en transito, cuyo stock actual ha caido por debajo del Punto de Reorden (ROP) y pertenece al intervalo de tiempo seleccionado.")
     
     df_optimo = df_modelo[
         (df_modelo['stock_actual'] < df_modelo['rop']) &
