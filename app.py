@@ -1155,6 +1155,7 @@ with tab7:
         (df_modelo['stock_transito'] == 0) &
         (df_modelo['clase_abc'].isin(['AA', 'A'])) &
         (df_modelo['pedir_cajas'] > 0) &
+        (df_modelo['total_unidades'] > 0) &
         (~df_modelo['sku'].isin(['MASS3063', 'MASS3065', 'MASS3066']))
     ].copy()
     
