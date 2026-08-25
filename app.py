@@ -245,6 +245,7 @@ def cargar_datos_base():
     df_clean['total_costo'] = pd.to_numeric(df_clean['total_costo'].astype(str).str.replace(',', ''), errors='coerce').fillna(0.0)
     df_clean['costo_unit_trans'] = pd.to_numeric(df_clean['costo_unit_trans'].astype(str).str.replace(',', ''), errors='coerce').fillna(0.0)
     df_clean['fecha'] = pd.to_datetime(df_clean['fecha'], format='mixed', dayfirst=True)
+    df_clean = df_clean[df_clean['sku'] != 'MASS1575']
     
     # 2. Extraer fallback de nombres de las transacciones
     df_nombres_trans = df_clean[['sku', 'nombre_trans']].drop_duplicates(subset=['sku'], keep='last')
@@ -264,6 +265,7 @@ def cargar_datos_base():
     df_art_clean['nombre_articulo'] = df_art_clean['nombre_articulo'].astype(str).apply(limpiar_mojibake)
     df_art_clean['categoria'] = df_art_clean['categoria'].fillna('GENERAL').astype(str).str.strip()
     df_art_clean = df_art_clean.drop_duplicates(subset=['sku'], keep='last')
+    df_art_clean = df_art_clean[df_art_clean['sku'] != 'MASS1575']
     
     # 3. Metadata logistica + Stock en Transito
     df_cons = pd.read_csv('consolidado.csv', encoding='latin1')
@@ -283,6 +285,7 @@ def cargar_datos_base():
     # Sum transit quantities per SKU (could be in both containers)
     df_stock_transito = df_transit_exp.groupby('sku')['cantidad'].sum().reset_index()
     df_stock_transito.columns = ['sku', 'stock_transito']
+    df_stock_transito = df_stock_transito[df_stock_transito['sku'] != 'MASS1575']
     
     # Metadata de costos/empaque (todas las filas)
     df_cons_meta = df_cons[['codigo', 'costo', 'cantidad_por_caja', 'CBMM']].dropna(subset=['codigo'])
@@ -296,6 +299,7 @@ def cargar_datos_base():
     df_cons_exp['sku'] = df_cons_exp['sku'].str.strip()
     df_cons_exp = df_cons_exp[df_cons_exp['sku'] != ''].drop_duplicates(subset=['sku'], keep='last')
     df_metadata = df_cons_exp[['sku', 'costo', 'cantidad_por_caja', 'CBMM']]
+    df_metadata = df_metadata[df_metadata['sku'] != 'MASS1575']
     
     # 4. Catalogo de Imagenes y Nombres (IMAGES.csv)
     df_images = pd.read_csv('IMAGES.csv', encoding='latin1')
@@ -355,12 +359,15 @@ with st.sidebar:
     st.subheader("Ventana Temporal de Demanda")
     opcion_tiempo = st.selectbox(
         "Período analizado:",
-        ["Último Año", "Últimos 6 meses", "Últimos 3 meses"],
+        ["Último Año", "Últimos 6 meses", "Últimos 3 meses", "Todo el historial"],
         key="sidebar_periodo"
     )
     
     fecha_max = df_trans['fecha'].max()
-    if "6 meses" in opcion_tiempo:
+    if "Año" in opcion_tiempo:
+        fecha_corte = fecha_max - pd.DateOffset(years=1)
+        df_trans_filtrada = df_trans[df_trans['fecha'] >= fecha_corte].copy()
+    elif "6 meses" in opcion_tiempo:
         fecha_corte = fecha_max - pd.DateOffset(months=6)
         df_trans_filtrada = df_trans[df_trans['fecha'] >= fecha_corte].copy()
     elif "3 meses" in opcion_tiempo:
@@ -368,6 +375,23 @@ with st.sidebar:
         df_trans_filtrada = df_trans[df_trans['fecha'] >= fecha_corte].copy()
     else:
         df_trans_filtrada = df_trans.copy()
+        
+    st.divider()
+    st.subheader("Configuración de Pronóstico")
+    opcion_lookback = st.selectbox(
+        "Historial para ROP y EOQ:",
+        ["Últimas 52 semanas (1 año)", "Últimas 26 semanas (6 meses)", "Últimas 12 semanas (3 meses)", "Todo el historial disponible"],
+        key="sidebar_lookback"
+    )
+    
+    if "52" in opcion_lookback:
+        lookback_weeks = 52
+    elif "26" in opcion_lookback:
+        lookback_weeks = 26
+    elif "12" in opcion_lookback:
+        lookback_weeks = 12
+    else:
+        lookback_weeks = None
     
     st.divider()
     st.subheader("Parámetros del Contenedor")
@@ -384,20 +408,106 @@ with st.sidebar:
 # 4. MOTOR VECTORIZADO DE CALCULO
 # ══════════════════════════════════════════════════════════════════════════════
 @st.cache_data
-def ejecutar_motor(df_t, _df_a, _df_m, _df_info, _df_transit, lt, flete, cap_cont, tasa, c_orden):
+def ejecutar_motor(df_t, _df_a, _df_m, _df_info, _df_transit, lt, flete, cap_cont, tasa, c_orden, lookback_weeks):
     df_semanal = df_t.groupby(['sku', pd.Grouper(key='fecha', freq='W-MON')])['cantidad'].sum().unstack(fill_value=0.0)
     
-    d_prom = df_semanal.mean(axis=1)
-    d_std = df_semanal.std(axis=1, ddof=1).fillna(0.0)
-    cv = np.where(d_prom > 0, d_std / d_prom, 0.0)
+    # ── CÁLCULO SKU POR SKU (Alineado con ejecutar_modelo.py) ──
+    resultados = []
+    adi_umbral = 1.32
+    cv2_umbral = 0.49
+    percentil_ss = 90
+    winsor_percentil = 0.95
     
-    df_calc = pd.DataFrame({
-        'sku': df_semanal.index,
-        'demanda_semanal_prom': d_prom.values,
-        'demanda_semanal_std': d_std.values,
-        'cv': cv
-    })
+    for sku in df_semanal.index:
+        ts = df_semanal.loc[sku]
+        if ts.sum() == 0:
+            resultados.append({
+                'sku': sku, 'cuadrante': 'sin_datos', 'adi': 0, 'cv': np.nan, 'n_pos': 0,
+                'demanda_semanal_prom': 0.0, 'demanda_semanal_std': 0.0, 'mu_sba': 0.0,
+                'demanda_esperada_lt': 0.0, 'ss_empirico': 0.0, 'rop': 0.0
+            })
+            continue
+
+        first_nonzero = ts.ne(0).idxmax()
+        ts_trim = ts.loc[first_nonzero:]
+        
+        # Limitar a lookback_weeks
+        if lookback_weeks is not None and len(ts_trim) > lookback_weeks:
+            ts_win_slice = ts_trim.iloc[-lookback_weeks:]
+        else:
+            ts_win_slice = ts_trim
+            
+        n_periodos = len(ts_win_slice)
+        pos_mask = ts_win_slice > 0
+        pos_sales = ts_win_slice[pos_mask]
+        n_pos = len(pos_sales)
+        
+        adi = n_periodos / n_pos if n_pos > 0 else float('inf')
+        
+        if n_pos <= 1:
+            cuadrante = 'sin_datos'
+            cv2 = np.nan
+            cv = np.nan
+        else:
+            mu_pos = pos_sales.mean()
+            std_pos = pos_sales.std(ddof=1)
+            cv2 = (std_pos / mu_pos) ** 2 if mu_pos > 0 else 0
+            cv = std_pos / mu_pos if mu_pos > 0 else 0
+            
+            if adi < adi_umbral and cv2 < cv2_umbral:
+                cuadrante = 'smooth'
+            elif adi >= adi_umbral and cv2 < cv2_umbral:
+                cuadrante = 'intermittent'
+            elif adi < adi_umbral and cv2 >= cv2_umbral:
+                cuadrante = 'erratic'
+            else:
+                cuadrante = 'lumpy'
+                
+        # Winsorización
+        if n_pos >= 2:
+            clip_upper = pos_sales.quantile(winsor_percentil)
+            ts_win = ts_win_slice.clip(upper=clip_upper)
+        else:
+            ts_win = ts_win_slice.copy()
+            
+        mu_incondicional = ts_win.mean()
+        
+        # SBA
+        if cuadrante == 'intermittent' and not np.isnan(cv2):
+            mu_sba = mu_incondicional * (1 - cv2 / 2)
+            mu_sba = max(0, mu_sba)
+        else:
+            mu_sba = mu_incondicional
+            
+        demanda_esperada_lt = mu_sba * lt
+        
+        # SS empírico para lumpy/intermittent
+        if cuadrante in ('lumpy', 'intermittent') and len(ts_win) >= lt:
+            rolling_demand = ts_win.rolling(window=lt).sum().dropna()
+            errors = rolling_demand - demanda_esperada_lt
+            ss_empirico = max(0, float(np.percentile(errors, percentil_ss)))
+        else:
+            ss_empirico = 0.0 # Se refinará para Smooth/Erratic después de asignar clase_abc y nivel_servicio
+            
+        rop = demanda_esperada_lt + ss_empirico
+        
+        resultados.append({
+            'sku': sku,
+            'cuadrante': cuadrante,
+            'adi': adi,
+            'cv': cv if not np.isnan(cv) else 0.0,
+            'n_pos': n_pos,
+            'demanda_semanal_prom': mu_incondicional,
+            'demanda_semanal_std': ts_win_slice.std(ddof=1) if len(ts_win_slice) > 1 else 0.0,
+            'mu_sba': mu_sba,
+            'demanda_esperada_lt': demanda_esperada_lt,
+            'ss_empirico': ss_empirico,
+            'rop': rop
+        })
+        
+    df_calc = pd.DataFrame(resultados)
     
+    # ── COMBINACIÓN CON METADATA Y CLASIFICACIONES ──
     ventas = df_t.groupby('sku').agg(
         total_ventas=('total_venta', 'sum'),
         total_unidades=('cantidad', 'sum'),
@@ -408,7 +518,7 @@ def ejecutar_motor(df_t, _df_a, _df_m, _df_info, _df_transit, lt, flete, cap_con
     df_calc = pd.merge(df_calc, _df_a[['sku', 'stock_actual']], on='sku', how='left')
     df_calc['stock_actual'] = df_calc['stock_actual'].fillna(0.0)
     
-    # Stock en Transito desde consolidado.csv
+    # Stock en Transito
     df_calc = pd.merge(df_calc, _df_transit, on='sku', how='left')
     df_calc['stock_transito'] = df_calc['stock_transito'].fillna(0.0)
     df_calc['stock_total_disponible'] = df_calc['stock_actual'] + df_calc['stock_transito']
@@ -448,22 +558,26 @@ def ejecutar_motor(df_t, _df_a, _df_m, _df_info, _df_transit, lt, flete, cap_con
     }
     df_calc['nivel_servicio'] = [ns_map.get((a, x), 0.85) for a, x in zip(df_calc['clase_abc'], df_calc['clase_xyz'])]
     
-    # ROP y EOQ
+    # Recalcular ROP y SS Gaussiano para Smooth/Erratic con Z dinámico
+    mask_gauss = df_calc['cuadrante'].isin(['smooth', 'erratic'])
+    z_scores = stats.norm.ppf(df_calc.loc[mask_gauss, 'nivel_servicio'])
+    df_calc.loc[mask_gauss, 'ss_empirico'] = np.maximum(
+        0.0,
+        z_scores * df_calc.loc[mask_gauss, 'demanda_semanal_std'] * math.sqrt(lt)
+    )
+    df_calc.loc[mask_gauss, 'rop'] = df_calc.loc[mask_gauss, 'demanda_esperada_lt'] + df_calc.loc[mask_gauss, 'ss_empirico']
+    
+    # ROP y EOQ generales
     df_calc['cbm_unitario'] = df_calc['CBMM'] / df_calc['cantidad_por_caja']
     df_calc['flete_unitario_usd'] = df_calc['cbm_unitario'] * flete
     df_calc['costo_puesto'] = df_calc['costo'] + df_calc['flete_unitario_usd']
-    df_calc['demanda_esperada_lt'] = df_calc['demanda_semanal_prom'] * lt
-    
-    z_score = stats.norm.ppf(df_calc['nivel_servicio'])
-    df_calc['stock_seguridad'] = z_score * df_calc['demanda_semanal_std'] * math.sqrt(lt)
-    df_calc['rop'] = df_calc['demanda_esperada_lt'] + df_calc['stock_seguridad']
     
     h = df_calc['costo_puesto'] * tasa
     d_anual = df_calc['demanda_semanal_prom'] * 52.0
     eoq = np.where(h > 0, np.sqrt((2 * d_anual * c_orden) / h), 0.0)
     eoq = np.nan_to_num(eoq, nan=0.0)
     
-    # Decision de pedido: stock_actual + stock_transito vs ROP
+    # Decision de pedido
     df_calc['requiere_pedido'] = df_calc['stock_total_disponible'] <= df_calc['rop']
     df_calc['estado'] = np.where(df_calc['requiere_pedido'], 'REORDENAR', 'OK')
     
@@ -478,7 +592,24 @@ def ejecutar_motor(df_t, _df_a, _df_m, _df_info, _df_transit, lt, flete, cap_con
     
     return df_calc
 
-df_modelo = ejecutar_motor(df_trans_filtrada, df_art, df_metadata, df_info_prod, df_stock_transito, lead_time, flete_cbm, capacidad_cont, tasa_mant, costo_orden)
+df_modelo = ejecutar_motor(df_trans_filtrada, df_art, df_metadata, df_info_prod, df_stock_transito, lead_time, flete_cbm, capacidad_cont, tasa_mant, costo_orden, lookback_weeks)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 4.5 MOTOR SECUNDARIO: AGREGACIÓN MENSUAL (Para Fichas Visuales)
+# ══════════════════════════════════════════════════════════════════════════════
+df_agrupado_m = df_trans_filtrada.groupby(['sku', pd.Grouper(key='fecha', freq='MS')])['cantidad'].sum().unstack(fill_value=0.0)
+d_prom_m = df_agrupado_m.mean(axis=1)
+d_std_m = df_agrupado_m.std(axis=1, ddof=1).fillna(0.0)
+cv_m = np.where(d_prom_m > 0, d_std_m / d_prom_m, 0.0)
+
+df_mensual_abc_xyz = pd.DataFrame({'sku': df_agrupado_m.index, 'demanda_mensual_prom': d_prom_m.values, 'cv': cv_m})
+df_mensual_abc_xyz = pd.merge(df_mensual_abc_xyz, df_modelo[['sku', 'nombre', 'categoria', 'clase_abc', 'total_ventas', 'requiere_pedido']], on='sku', how='inner')
+
+df_mensual_abc_xyz['clase_xyz'] = np.select(
+    [df_mensual_abc_xyz['cv'] <= 0.5, df_mensual_abc_xyz['cv'] <= 1.0],
+    ['X', 'Y'], default='Z'
+)
+df_mensual_abc_xyz['clase_abc_xyz'] = df_mensual_abc_xyz['clase_abc'] + '-' + df_mensual_abc_xyz['clase_xyz']
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 5. HEADER CORPORATIVO MASSHOPPING
@@ -674,6 +805,18 @@ with tab2:
         pct_reord = df_modelo.groupby(['clase_abc', 'clase_xyz'])['requiere_pedido'].mean().unstack(fill_value=0) * 100
         st.dataframe(pct_reord.style.format("{:.1f}%"), use_container_width=True)
 
+    st.markdown("---")
+    st.subheader("Simulación de Matriz Estratégica (Agregación Mensual)")
+    st.caption("Esta matriz muestra cómo se distribuyen los productos si la variabilidad (XYZ) se calcula agrupando las ventas por mes.")
+    col_m3, col_m4 = st.columns(2)
+    with col_m3:
+        st.markdown("### Conteo de SKUs Mensual")
+        st.dataframe(pd.crosstab(df_mensual_abc_xyz['clase_abc'], df_mensual_abc_xyz['clase_xyz'], margins=True, margins_name='Total'), use_container_width=True)
+    with col_m4:
+        st.markdown("### % que Requiere Reorden Inmediato (Matriz Mensual)")
+        pct_reord_m = df_mensual_abc_xyz.groupby(['clase_abc', 'clase_xyz'])['requiere_pedido'].mean().unstack(fill_value=0) * 100
+        st.dataframe(pct_reord_m.style.format("{:.1f}%"), use_container_width=True)
+
 # ══════════════════════════════════════════════════════════════════════════════
 # TAB 3: EXPLORADOR VISUAL & COMPARADOR (SIN ROP LINE, CON TENDENCIA)
 # ══════════════════════════════════════════════════════════════════════════════
@@ -738,15 +881,15 @@ with tab3:
                 <div class="kpi-grid">
                     <div class="kpi-card">
                         <div class="kpi-title">Stock Actual</div>
-                        <div class="kpi-number">{item['stock_actual']:,.0f} und</div>
+                        <div class="kpi-number">{item['stock_actual']:,.0f} uds</div>
                     </div>
                     <div class="kpi-card">
                         <div class="kpi-title">En Transito</div>
-                        <div class="kpi-number">{transit_val:,.0f} und</div>
+                        <div class="kpi-number">{transit_val:,.0f} uds</div>
                     </div>
                     <div class="kpi-card">
                         <div class="kpi-title">Punto Reorden (ROP)</div>
-                        <div class="kpi-number">{item['rop']:,.1f} und</div>
+                        <div class="kpi-number">{item['rop']:,.1f} uds</div>
                     </div>
                     <div class="kpi-card">
                         <div class="kpi-title">Estado</div>
@@ -777,8 +920,8 @@ with tab3:
         st.caption("Linea de tendencia = promedio movil de 4 semanas. Linea naranja de fondo = Variacion porcentual interdiaria del USDT (Binance P2P).")
         
         # Local Date Range Filter for the Chart
-        fecha_min_global = df_trans_filtrada['fecha'].min().date() if not df_trans_filtrada.empty else datetime.date(2023,1,1)
-        fecha_max_global = df_trans_filtrada['fecha'].max().date() if not df_trans_filtrada.empty else datetime.date(2026,12,31)
+        fecha_min_global = df_trans['fecha'].min().date() if not df_trans.empty else datetime.date(2023,1,1)
+        fecha_max_global = df_trans['fecha'].max().date() if not df_trans.empty else datetime.date(2026,12,31)
         
         import datetime
         
@@ -795,19 +938,19 @@ with tab3:
         with col_chk2:
             mostrar_p2p = st.checkbox("Mostrar Variacion USDT (P2P)", value=False)
             
-        # Apply local date filter to df_trans_filtrada
-        df_plot_trans = df_trans_filtrada
+        # Apply local date filter to df_trans (full history)
+        df_plot_trans = df_trans
         if isinstance(rango_local, tuple):
             if len(rango_local) == 2:
                 start_loc, end_loc = rango_local
-                df_plot_trans = df_trans_filtrada[
-                    (df_trans_filtrada['fecha'].dt.date >= start_loc) &
-                    (df_trans_filtrada['fecha'].dt.date <= end_loc)
+                df_plot_trans = df_trans[
+                    (df_trans['fecha'].dt.date >= start_loc) &
+                    (df_trans['fecha'].dt.date <= end_loc)
                 ]
             elif len(rango_local) == 1:
                 start_loc = rango_local[0]
-                df_plot_trans = df_trans_filtrada[
-                    df_trans_filtrada['fecha'].dt.date >= start_loc
+                df_plot_trans = df_trans[
+                    df_trans['fecha'].dt.date >= start_loc
                 ]
         
         from plotly.subplots import make_subplots
@@ -861,7 +1004,7 @@ with tab3:
                 name=legend_name,
                 line=dict(width=2, color=color_linea),
                 marker=dict(size=4),
-                hovertemplate="<b>" + sku_code + "</b><br>Fecha: %{x|%d %b %Y}<br>Cantidad: <b>%{y:,.0f} unds</b><extra></extra>"
+                hovertemplate="<b>" + sku_code + "</b><br>Fecha: %{x|%d %b %Y}<br>Cantidad: <b>%{y:,.0f} uds</b><extra></extra>"
             ), secondary_y=False)
             
             # Linea de tendencia (promedio movil de 4 semanas)
@@ -873,7 +1016,7 @@ with tab3:
                     mode='lines',
                     name=f"Tendencia {sku_code}",
                     line=dict(width=2.5, color=color_linea, dash='dash'),
-                    hovertemplate="<b>Tendencia " + sku_code + "</b><br>Fecha: %{x|%d %b %Y}<br>Promedio movil: <b>%{y:,.1f} unds</b><extra></extra>",
+                    hovertemplate="<b>Tendencia " + sku_code + "</b><br>Fecha: %{x|%d %b %Y}<br>Promedio movil: <b>%{y:,.1f} uds</b><extra></extra>",
                     showlegend=True
                 ), secondary_y=False)
         
@@ -898,8 +1041,37 @@ with tab3:
             paper_bgcolor="#FFFFFF"
         )
         
-        fig.update_yaxes(title_text="Unidades Vendidas / Semana", showgrid=True, gridcolor="#EBF4EE", secondary_y=False)
-        fig.update_yaxes(title_text="Variacion USDT (%)", showgrid=False, secondary_y=True)
+        # Calcular y1_max para alinear ceros
+        y1_max = 0
+        for sku_code in skus_codigos:
+            df_hist_sku = df_plot_trans[df_plot_trans['sku'] == sku_code]
+            if not df_hist_sku.empty:
+                serie_cant = df_hist_sku.groupby(pd.Grouper(key='fecha', freq='W-MON'))['cantidad'].sum()
+                if not serie_cant.empty:
+                    y1_max = max(y1_max, serie_cant.max())
+        y1_max = max(y1_max, 1)
+
+        # Calcular y2_min y y2_max
+        if mostrar_p2p and not df_p2p.empty and 'df_p2p_f' in locals() and not df_p2p_f.empty:
+            y2_min = df_p2p_f['var_pct'].min()
+            y2_max = df_p2p_f['var_pct'].max()
+        else:
+            y2_min, y2_max = 0, 0
+
+        # Configurar rangos alineando el cero
+        if y2_min < 0 < y2_max:
+            y1_min = y1_max * (y2_min / y2_max)
+            fig.update_yaxes(title_text="Unidades Vendidas / Semana", showgrid=True, gridcolor="#EBF4EE", range=[y1_min, y1_max * 1.1], secondary_y=False)
+            fig.update_yaxes(title_text="Variacion USDT (%)", showgrid=False, range=[y2_min, y2_max * 1.1], secondary_y=True)
+        else:
+            fig.update_yaxes(title_text="Unidades Vendidas / Semana", showgrid=True, gridcolor="#EBF4EE", range=[0, y1_max * 1.1], secondary_y=False)
+            if y2_min != y2_max:
+                fig.update_yaxes(title_text="Variacion USDT (%)", showgrid=False, range=[y2_min * 1.1, y2_max * 1.1], secondary_y=True)
+            else:
+                fig.update_yaxes(title_text="Variacion USDT (%)", showgrid=False, secondary_y=True)
+
+        # Agregar linea de referencia para el 0 de ambos ejes (coinciden en la misma altura)
+        fig.add_hline(y=0, line_dash="dash", line_color="rgba(230, 81, 0, 0.8)", line_width=2, yref="y2")
         
         st.plotly_chart(fig, use_container_width=True)
         
@@ -921,6 +1093,119 @@ with tab3:
                 st.metric("Total Ventas (Aprox USD Costo)", f"${total_usd:,.2f}")
         else:
             st.info("No hay datos de venta en el rango seleccionado para los productos elegidos.")
+
+        # =========================================================
+        # ANALISIS MENSUAL ADICIONAL (Agregación por Mes)
+        # =========================================================
+        st.markdown("---")
+        st.subheader("Simulación de Agregación Mensual")
+        st.caption("Si agregamos las ventas por MES en lugar de por semana, la variabilidad (CV2) y la intermitencia (ADI) se suavizan drásticamente. Observa cómo cambiaría la clasificación (Cuadrante) de los productos seleccionados bajo un modelo mensual.")
+        
+        if len(skus_codigos) > 0:
+            fig_m = make_subplots(specs=[[{"secondary_y": False}]])
+            resultados_mensuales = []
+            
+            for idx, sku_code in enumerate(skus_codigos):
+                df_hist_sku = df_plot_trans[df_plot_trans['sku'] == sku_code].copy()
+                
+                # Agregación mensual (MS = Month Start)
+                ts_mensual = df_hist_sku.groupby(pd.Grouper(key='fecha', freq='MS'))['cantidad'].sum()
+                serie_m = ts_mensual.reset_index().sort_values('fecha')
+                
+                color_linea = paleta_colores[idx % len(paleta_colores)]
+                fig_m.add_trace(go.Scatter(
+                    x=serie_m['fecha'], y=serie_m['cantidad'],
+                    mode='lines+markers', name=sku_code,
+                    line=dict(width=2, color=color_linea),
+                    marker=dict(size=6),
+                    hovertemplate="<b>" + sku_code + "</b><br>Mes: %{x|%b %Y}<br>Cantidad: <b>%{y:,.0f} uds</b><extra></extra>"
+                ))
+                
+                # Calculo de cuadrante mensual
+                if ts_mensual.sum() > 0:
+                    first_nonzero_m = ts_mensual.ne(0).idxmax()
+                    ts_trim_m = ts_mensual.loc[first_nonzero_m:]
+                    n_periodos_m = len(ts_trim_m)
+                    pos_sales_m = ts_trim_m[ts_trim_m > 0]
+                    n_pos_m = len(pos_sales_m)
+                    
+                    adi_m = n_periodos_m / n_pos_m if n_pos_m > 0 else float('inf')
+                    if n_pos_m > 1:
+                        mu_pos_m = pos_sales_m.mean()
+                        std_pos_m = pos_sales_m.std(ddof=1)
+                        cv2_m = (std_pos_m / mu_pos_m) ** 2 if mu_pos_m > 0 else 0
+                    else:
+                        cv2_m = np.nan
+                        
+                    if adi_m < 1.32 and cv2_m < 0.49:
+                        cuad_m = 'smooth'
+                    elif adi_m >= 1.32 and cv2_m < 0.49:
+                        cuad_m = 'intermittent'
+                    elif adi_m < 1.32 and cv2_m >= 0.49:
+                        cuad_m = 'erratic'
+                    else:
+                        cuad_m = 'lumpy'
+                else:
+                    adi_m = 0
+                    cv2_m = np.nan
+                    cuad_m = 'sin_datos'
+                    
+                # Calculo de cuadrante SEMANAL (Real)
+                ts_semanal = df_hist_sku.groupby(pd.Grouper(key='fecha', freq='W-MON'))['cantidad'].sum()
+                if ts_semanal.sum() > 0:
+                    first_nonzero_w = ts_semanal.ne(0).idxmax()
+                    ts_trim_w = ts_semanal.loc[first_nonzero_w:]
+                    n_periodos_w = len(ts_trim_w)
+                    pos_sales_w = ts_trim_w[ts_trim_w > 0]
+                    n_pos_w = len(pos_sales_w)
+                    
+                    adi_w = n_periodos_w / n_pos_w if n_pos_w > 0 else float('inf')
+                    if n_pos_w > 1:
+                        mu_pos_w = pos_sales_w.mean()
+                        std_pos_w = pos_sales_w.std(ddof=1)
+                        cv2_w = (std_pos_w / mu_pos_w) ** 2 if mu_pos_w > 0 else 0
+                    else:
+                        cv2_w = np.nan
+                        
+                    if adi_w < 1.32 and cv2_w < 0.49:
+                        cuad_w = 'smooth'
+                    elif adi_w >= 1.32 and cv2_w < 0.49:
+                        cuad_w = 'intermittent'
+                    elif adi_w < 1.32 and cv2_w >= 0.49:
+                        cuad_w = 'erratic'
+                    else:
+                        cuad_w = 'lumpy'
+                else:
+                    adi_w = 0
+                    cv2_w = np.nan
+                    cuad_w = 'sin_datos'
+                
+                resultados_mensuales.append({
+                    'SKU': sku_code,
+                    'Intermitencia (SEMANAL)': str(cuad_w).upper(),
+                    'ADI (Semanal)': f"{adi_w:.2f}",
+                    'CV2 (Semanal)': f"{cv2_w:.2f}" if not np.isnan(cv2_w) else 'N/A',
+                    'Venta/Sem': f"{ts_semanal.mean():.1f}",
+                    '|': '|',
+                    'Intermitencia (MENSUAL)': str(cuad_m).upper(),
+                    'ADI (Mensual)': f"{adi_m:.2f}",
+                    'CV2 (Mensual)': f"{cv2_m:.2f}" if not np.isnan(cv2_m) else 'N/A',
+                    'Venta/Mes': f"{ts_mensual.mean():.1f}"
+                })
+            
+            fig_m.update_layout(
+                height=400, margin=dict(l=20, r=20, t=30, b=30),
+                hovermode="x unified",
+                xaxis=dict(title="Mes", tickformat="%b %Y", showgrid=True, gridcolor="#EBF4EE"),
+                yaxis=dict(title="Unidades Vendidas / Mes", showgrid=True, gridcolor="#EBF4EE"),
+                plot_bgcolor="#FFFFFF", paper_bgcolor="#FFFFFF"
+            )
+            
+            st.plotly_chart(fig_m, use_container_width=True)
+            
+            # Tabla comparativa
+            st.markdown("**Comparativa de Diagnóstico (Semanal vs Mensual):**")
+            st.dataframe(pd.DataFrame(resultados_mensuales), use_container_width=True)
 
 # ══════════════════════════════════════════════════════════════════════════════
 # TAB 4: TOTALIZACION POR CATEGORIA
@@ -1085,6 +1370,66 @@ with tab5:
         }).map(color_abc, subset=['clase_abc']),
         use_container_width=True
     )
+    
+    st.markdown("---")
+    st.subheader("Simulación de Análisis ABC (Agregación Mensual)")
+    st.caption("Nota matemática: La clasificación ABC se basa en el **Total de Ventas** del período. La suma de ventas es idéntica independientemente de si se suma día a día, semana a semana o mes a mes. Por tanto, el gráfico y las clasificaciones ABC no cambian al usar agregación mensual.")
+
+    fig_abc_m = make_subplots(specs=[[{"secondary_y": True}]])
+    
+    for clase in ['AA', 'A', 'B', 'C']:
+        mask_clase_m = df_abc['clase_abc'] == clase
+        if mask_clase_m.any():
+            fig_abc_m.add_trace(go.Bar(
+                x=df_abc[mask_clase_m]['sku'],
+                y=df_abc[mask_clase_m]['total_ventas'],
+                name=f"Clase {clase} (Mensual)",
+                marker_color=color_map.get(clase),
+                hovertemplate="<b>%{x}</b><br>Clase: " + clase + "<br>Ventas Totales: $%{y:,.2f}<extra></extra>"
+            ), secondary_y=False)
+            
+    fig_abc_m.add_trace(go.Scatter(
+        x=df_abc['sku'],
+        y=df_abc['pct_acum'],
+        mode='lines',
+        name='% Acumulado',
+        line=dict(color='#E65100', width=3),
+        hovertemplate="<b>%{x}</b><br>% Acumulado: %{y:.1f}%<extra></extra>"
+    ), secondary_y=True)
+    
+    fig_abc_m.update_layout(
+        height=500,
+        title="Pareto ABC por Ingresos (Perspectiva Mensual)",
+        xaxis=dict(showticklabels=False, title="Productos ordenados por Ventas", showgrid=False),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        plot_bgcolor="#FFFFFF",
+        paper_bgcolor="#FFFFFF",
+        margin=dict(l=20, r=20, t=50, b=20)
+    )
+    fig_abc_m.update_yaxes(title_text="Ventas Totales ($)", secondary_y=False, showgrid=True, gridcolor="#EBF4EE")
+    fig_abc_m.update_yaxes(title_text="% Acumulado", secondary_y=True, range=[0, 105], showgrid=False)
+    
+    st.plotly_chart(fig_abc_m, use_container_width=True)
+
+    df_abc_table_m = df_abc[['sku', 'nombre', 'total_ventas', 'pct_acum', 'clase_abc']].copy()
+    df_abc_table_m['pct_venta'] = (df_abc_table_m['total_ventas'] / df_abc_table_m['total_ventas'].sum()) * 100
+    df_abc_table_m = df_abc_table_m[['sku', 'nombre', 'total_ventas', 'pct_venta', 'pct_acum', 'clase_abc']]
+    
+    search_abc_m = st.text_input("Buscar producto por código o nombre (ABC Mensual):", key="search_abc_m").strip().lower()
+    if search_abc_m:
+        df_abc_table_m = df_abc_table_m[
+            df_abc_table_m['sku'].str.lower().str.contains(search_abc_m) | 
+            df_abc_table_m['nombre'].str.lower().str.contains(search_abc_m)
+        ]
+        
+    st.dataframe(
+        df_abc_table_m.style.format({
+            'total_ventas': '${:,.2f}',
+            'pct_venta': '{:.2f}%',
+            'pct_acum': '{:.2f}%'
+        }).map(color_abc, subset=['clase_abc']),
+        use_container_width=True
+    )
 
 # ══════════════════════════════════════════════════════════════════════════════
 # TAB 6: ANALISIS VISUAL XYZ
@@ -1143,6 +1488,48 @@ with tab6:
     st.dataframe(
         df_xyz_table.style.format({
             'demanda_semanal_prom': '{:.1f}',
+            'cv': '{:.3f}'
+        }).map(color_xyz, subset=['clase_xyz']),
+        use_container_width=True
+    )
+
+    st.markdown("---")
+    st.subheader("Simulación XYZ (Agregación Mensual)")
+    st.caption("Identificación de volatilidad usando un Coeficiente de Variación (CV) basado en demandas **Mensuales**. Notarás que muchos SKUs migran hacia X o Y.")
+    
+    fig_xyz_m = px.scatter(
+        df_mensual_abc_xyz,
+        x='demanda_mensual_prom',
+        y='cv',
+        color='clase_xyz',
+        color_discrete_map={'X': '#5AA06E', 'Y': '#FDD835', 'Z': '#E65100'},
+        hover_name='sku',
+        hover_data=['nombre', 'clase_abc'],
+        labels={'demanda_mensual_prom': 'Demanda Promedio (Mensual)', 'cv': 'CV (Mensual)'}
+    )
+    fig_xyz_m.add_hline(y=0.5, line_dash="dash", line_color="gray", annotation_text="Limite X-Y (0.5)")
+    fig_xyz_m.add_hline(y=1.0, line_dash="dash", line_color="gray", annotation_text="Limite Y-Z (1.0)")
+    
+    fig_xyz_m.update_layout(
+        height=500, plot_bgcolor="#FFFFFF", paper_bgcolor="#FFFFFF",
+        xaxis=dict(showgrid=True, gridcolor="#EBF4EE"),
+        yaxis=dict(showgrid=True, gridcolor="#EBF4EE")
+    )
+    st.plotly_chart(fig_xyz_m, use_container_width=True)
+    
+    df_xyz_table_m = df_mensual_abc_xyz[['sku', 'nombre', 'demanda_mensual_prom', 'cv', 'clase_xyz']].copy()
+    df_xyz_table_m = df_xyz_table_m.sort_values('cv', ascending=False).reset_index(drop=True)
+    
+    search_xyz_m = st.text_input("Buscar producto por código o nombre (XYZ Mensual):", key="search_xyz_m").strip().lower()
+    if search_xyz_m:
+        df_xyz_table_m = df_xyz_table_m[
+            df_xyz_table_m['sku'].str.lower().str.contains(search_xyz_m) | 
+            df_xyz_table_m['nombre'].str.lower().str.contains(search_xyz_m)
+        ]
+        
+    st.dataframe(
+        df_xyz_table_m.style.format({
+            'demanda_mensual_prom': '{:.1f}',
             'cv': '{:.3f}'
         }).map(color_xyz, subset=['clase_xyz']),
         use_container_width=True

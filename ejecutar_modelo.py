@@ -18,6 +18,7 @@ PARAMETROS = {
     'adi_umbral': 1.32,
     'cv2_umbral': 0.49,
     'winsor_percentil': 0.95,        # P95 de ventas positivas para acotar outliers
+    'lookback_weeks': 52,            # 1 año (52 semanas) de historial para pronóstico y ROP/EOQ
 }
 LT = PARAMETROS['lead_time_semanas']
 
@@ -27,11 +28,13 @@ df_temp = [pd.read_csv(f"reporte ({r}).csv", encoding="latin1", low_memory=False
 df_trans = pd.concat(df_temp, ignore_index=True)
 col_art  = [c for c in df_trans.columns if 'digo' in c and 'rt' in c][0]
 col_fecha = [c for c in df_trans.columns if 'Fecha' in c][0]
-df_trans = df_trans[[col_art, col_fecha, 'Cantidad']].copy()
-df_trans.columns = ['sku', 'fecha', 'cantidad']
+df_trans = df_trans[[col_art, col_fecha, 'Cantidad', 'Total']].copy()
+df_trans.columns = ['sku', 'fecha', 'cantidad', 'total_venta']
 df_trans['sku'] = df_trans['sku'].astype(str).str.strip()
 df_trans['cantidad'] = pd.to_numeric(df_trans['cantidad'], errors='coerce').fillna(0.0)
+df_trans['total_venta'] = pd.to_numeric(df_trans['total_venta'].astype(str).str.replace(',', ''), errors='coerce').fillna(0.0)
 df_trans['fecha'] = pd.to_datetime(df_trans['fecha'], format='mixed', dayfirst=True)
+df_trans = df_trans[df_trans['sku'] != 'MASS1575']
 
 print("Cargando metadata...")
 df_art = pd.read_csv('articulos.csv', encoding='latin1')
@@ -41,6 +44,7 @@ df_art = df_art[[col_art_art, col_exist]].rename(columns={col_art_art: 'sku', co
 df_art['sku'] = df_art['sku'].astype(str).str.strip()
 df_art['stock_actual'] = pd.to_numeric(df_art['stock_actual'].astype(str).str.replace(',', ''), errors='coerce').fillna(0.0)
 df_art = df_art.drop_duplicates(subset=['sku'], keep='last')
+df_art = df_art[df_art['sku'] != 'MASS1575']
 
 df_cons = pd.read_csv('consolidado.csv', encoding='latin1')
 df_cons = df_cons[['codigo', 'costo', 'cantidad_por_caja', 'CBMM']].dropna(subset=['codigo'])
@@ -53,6 +57,7 @@ df_cons_exp = (
 )
 df_cons_exp['sku'] = df_cons_exp['sku'].str.strip()
 df_cons_exp = df_cons_exp[df_cons_exp['sku'] != ''].drop_duplicates(subset=['sku'], keep='last')
+df_cons_exp = df_cons_exp[df_cons_exp['sku'] != 'MASS1575']
 df_cons_exp = df_cons_exp[['sku', 'costo', 'cantidad_por_caja', 'CBMM']]
 
 print("Construyendo matriz semanal...")
@@ -83,16 +88,23 @@ for sku in df_semanal.index:
     # ts_trim: desde first_sale hasta fecha_max_dataset.
     # - Ceros ANTES de first_sale = estructurales (producto no existía). Se excluyen.
     # - Ceros DESPUÉS de first_sale = intermitencia real. Se mantienen.
-    # mu_incondicional y SS empírico se calculan sobre ts_trim (vida observable del SKU).
     first_nonzero = ts.ne(0).idxmax()
     ts_trim = ts.loc[first_nonzero:]
-    n_periodos = len(ts_trim)       # Períodos de vida observable del SKU
-    pos_mask = ts_trim > 0
-    pos_sales = ts_trim[pos_mask]
+    
+    # Aplicar ventana de historial (lookback)
+    lookback = PARAMETROS['lookback_weeks']
+    if lookback is not None and len(ts_trim) > lookback:
+        ts_win_slice = ts_trim.iloc[-lookback:]
+    else:
+        ts_win_slice = ts_trim
+
+    n_periodos = len(ts_win_slice)       # Períodos de vida observable en la ventana
+    pos_mask = ts_win_slice > 0
+    pos_sales = ts_win_slice[pos_mask]
     n_pos = len(pos_sales)
 
-    # ADI y CV² se calculan sobre datos CRUDOS (pre-winsorización)
-    # para que la clasificación de cuadrante refleje la naturaleza real de la demanda.
+    # ADI y CV² se calculan sobre datos CRUDOS (pre-winsorización) de la ventana
+    # para que la clasificación de cuadrante refleje la naturaleza reciente de la demanda.
     adi = n_periodos / n_pos if n_pos > 0 else float('inf')
 
     if n_pos <= 1:
@@ -113,16 +125,14 @@ for sku in df_semanal.index:
             cuadrante = 'lumpy'
 
     # ── WINSORIZACIÓN ──
-    # Acotar valores extremos al P95 de ventas positivas.
-    # Neutraliza compras corporativas/institucionales atípicas sin eliminar el
-    # período de la serie (los ceros de intermitencia se preservan intactos).
+    # Acotar valores extremos al P95 de ventas positivas de la ventana.
     if n_pos >= 2:
         clip_upper = pos_sales.quantile(PARAMETROS['winsor_percentil'])
-        ts_win = ts_trim.clip(upper=clip_upper)
+        ts_win = ts_win_slice.clip(upper=clip_upper)
     else:
-        ts_win = ts_trim.copy()
+        ts_win = ts_win_slice.copy()
 
-    # mu_incondicional sobre la serie WINSORIZADA (vida observable)
+    # mu_incondicional sobre la serie WINSORIZADA
     mu_incondicional = ts_win.mean()
 
     # SBA correccion de sesgo (solo para intermittent)
@@ -134,14 +144,14 @@ for sku in df_semanal.index:
 
     demanda_esperada_lt = mu_sba * LT
 
-    # SS empírico: ventanas rodantes sobre serie WINSORIZADA (vida observable).
+    # SS empírico: ventanas rodantes sobre serie WINSORIZADA en la ventana.
     if cuadrante in ('lumpy', 'intermittent') and len(ts_win) >= LT:
         rolling_demand = ts_win.rolling(window=LT).sum().dropna()
         errors = rolling_demand - demanda_esperada_lt
         ss_empirico = max(0, float(np.percentile(errors, PARAMETROS['percentil_ss'])))
-    elif cuadrante in ('smooth', 'erratic') and len(ts_trim) > 1:
-        std_global = ts_trim.std(ddof=1)
-        ss_empirico = max(0, 1.645 * std_global * math.sqrt(LT))  # Z=1.645 ~ 95%, se refinara con ABC
+    elif cuadrante in ('smooth', 'erratic') and len(ts_win) > 1:
+        std_global = ts_win.std(ddof=1)
+        ss_empirico = max(0, 1.645 * std_global * math.sqrt(LT))  # Z=1.645 ~ 95%
     else:
         ss_empirico = 0.0
 
@@ -156,8 +166,8 @@ for sku in df_semanal.index:
         'demanda_esperada_lt': demanda_esperada_lt,
         'ss_empirico': ss_empirico,
         'rop': rop,
-        'mu_semanal_global': ts.mean(),
-        'std_semanal_global': ts.std(ddof=1),
+        'mu_semanal_global': ts_win_slice.mean(),
+        'std_semanal_global': ts_win_slice.std(ddof=1) if len(ts_win_slice) > 1 else 0.0,
         'n_semanas_historia': len(ts_trim),
     })
 
@@ -176,12 +186,12 @@ df_sku['cantidad_por_caja'] = df_sku['cantidad_por_caja'].fillna(1.0).clip(lower
 df_sku['CBMM'] = df_sku['CBMM'].fillna(0.05).clip(lower=0.001)
 
 # ABC
-ventas_totales_sku = df_trans.groupby('sku')['cantidad'].sum().reset_index().rename(columns={'cantidad': 'total_unidades'})
+ventas_totales_sku = df_trans.groupby('sku')['total_venta'].sum().reset_index().rename(columns={'total_venta': 'total_ventas'})
 df_sku = df_sku.merge(ventas_totales_sku, on='sku', how='left')
-df_sku['total_unidades'] = df_sku['total_unidades'].fillna(0)
-df_sku = df_sku.sort_values('total_unidades', ascending=False).reset_index(drop=True)
-tot = df_sku['total_unidades'].sum()
-df_sku['pct_acum'] = df_sku['total_unidades'].cumsum() / tot if tot > 0 else 0
+df_sku['total_ventas'] = df_sku['total_ventas'].fillna(0)
+df_sku = df_sku.sort_values('total_ventas', ascending=False).reset_index(drop=True)
+tot = df_sku['total_ventas'].sum()
+df_sku['pct_acum'] = df_sku['total_ventas'].cumsum() / tot if tot > 0 else 0
 df_sku['clase_abc'] = np.select(
     [df_sku['pct_acum'] <= 0.50, df_sku['pct_acum'] <= 0.80, df_sku['pct_acum'] <= 0.95],
     ['AA', 'A', 'B'], default='C'
