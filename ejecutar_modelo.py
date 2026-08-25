@@ -258,7 +258,12 @@ columnas_export = [
 ]
 df_export = df_sku[[c for c in columnas_export if c in df_sku.columns]].copy()
 df_export = df_export.rename(columns={'sku': 'Codigo Articulo'})
-df_export.to_csv('pedidos_requeridos.csv', index=False, encoding='utf-8-sig')
+try:
+    df_export.to_csv('pedidos_requeridos.csv', index=False, encoding='utf-8-sig')
+    print("\npedidos_requeridos.csv actualizado exitosamente.")
+except PermissionError:
+    print("\n[ERROR] No se pudo guardar 'pedidos_requeridos.csv'. El archivo está abierto en otro programa (como Excel).")
+    print("Por favor, cierra el archivo y vuelve a ejecutar 'python ejecutar_modelo.py'.")
 
 print("=" * 60)
 print("MOTOR CUADRANTE - RESUMEN FINAL")
@@ -281,4 +286,3 @@ if len(m):
     print(f"  ROP NUEVO:               {r['rop']:.2f}   <-- (anterior: 6.87)")
 else:
     print("  MASS2221 no encontrado")
-print("\npedidos_requeridos.csv actualizado.")
