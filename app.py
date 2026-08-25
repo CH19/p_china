@@ -626,14 +626,15 @@ st.markdown("""
 # ══════════════════════════════════════════════════════════════════════════════
 # 6. PESTANAS PRINCIPALES
 # ══════════════════════════════════════════════════════════════════════════════
-tab1, tab7, tab3, tab4, tab5, tab6, tab2 = st.tabs([
+tab1, tab7, tab3, tab4, tab5, tab6, tab2, tab8 = st.tabs([
     "Armado y Simulacion de Contenedor",
     "Generador de Pedido Optimo",
     "Ficha Visual y Comparador",
     "Totalizacion por Categoria",
     "Analisis Visual ABC",
     "Analisis Visual XYZ",
-    "Matriz Estrategica ABC-XYZ"
+    "Matriz Estrategica ABC-XYZ",
+    "Sobre Stock y Stock Muerto"
 ])
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1601,6 +1602,154 @@ with tab7:
             mime="text/csv",
             type="primary"
         )
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB 8: SOBRE STOCK Y STOCK MUERTO
+# ══════════════════════════════════════════════════════════════════════════════
+with tab8:
+    st.markdown("#### Análisis de Sobre Stock y Stock Inactivo (Lento Movimiento)")
+    st.caption("Identifica productos que tienen stock disponible pero registran pocas o nulas ventas en los últimos 6 meses.")
+    
+    # ── 1. CÁLCULO DE VENTAS ACUMULADAS EN LOS ÚLTIMOS 6 MESES ──
+    fecha_max_t = df_trans['fecha'].max()
+    fecha_limite_6m = fecha_max_t - pd.DateOffset(months=6)
+    df_trans_6m = df_trans[df_trans['fecha'] >= fecha_limite_6m]
+    
+    ventas_6m_df = df_trans_6m.groupby('sku')['cantidad'].sum().reset_index().rename(columns={'cantidad': 'ventas_6m'})
+    
+    # Combinar con el catálogo de df_modelo para obtener el stock y costos actuales
+    df_sobre_stock = pd.merge(
+        df_modelo[['sku', 'nombre', 'categoria', 'stock_actual', 'costo', 'CBMM', 'cantidad_por_caja', 'stock_transito']], 
+        ventas_6m_df, 
+        on='sku', 
+        how='left'
+    )
+    df_sobre_stock['ventas_6m'] = df_sobre_stock['ventas_6m'].fillna(0.0)
+    
+    # ── 2. CONTROLES DEL REPORTE ──
+    col_ctrl1, col_ctrl2 = st.columns(2)
+    with col_ctrl1:
+        max_ventas = st.slider(
+            "Ventas máximas acumuladas en los últimos 6 meses (Uds):",
+            min_value=0, max_value=50, value=4, step=1,
+            key="slider_max_ventas_t8"
+        )
+    with col_ctrl2:
+        min_stock = st.slider(
+            "Stock mínimo en inventario para auditar (Uds):",
+            min_value=1, max_value=100, value=1, step=1,
+            key="slider_min_stock_t8"
+        )
+        
+    col_ctrl3, col_ctrl4 = st.columns([1.5, 2.5])
+    with col_ctrl3:
+        cats_t8 = sorted(df_sobre_stock['categoria'].unique().tolist())
+        selected_cats_t8 = st.multiselect(
+            "Filtrar por Categoría:",
+            options=cats_t8,
+            default=[],
+            placeholder="Todas las categorías",
+            key="multiselect_cats_t8"
+        )
+    with col_ctrl4:
+        search_txt_t8 = st.text_input(
+            "Buscar producto (código o nombre):", 
+            key="search_txt_t8"
+        ).strip().lower()
+
+    # ── 3. FILTRADO DE LA DATA ──
+    mask_t8 = (df_sobre_stock['stock_actual'] >= min_stock) & (df_sobre_stock['ventas_6m'] <= max_ventas)
+    
+    if selected_cats_t8:
+        mask_t8 = mask_t8 & (df_sobre_stock['categoria'].isin(selected_cats_t8))
+        
+    if search_txt_t8:
+        mask_t8 = mask_t8 & (
+            df_sobre_stock['sku'].str.lower().str.contains(search_txt_t8) | 
+            df_sobre_stock['nombre'].str.lower().str.contains(search_txt_t8)
+        )
+        
+    df_sobre_stock_filtrado = df_sobre_stock[mask_t8].copy()
+    
+    # Métricas calculadas para los SKUs inactivos
+    df_sobre_stock_filtrado['valor_inventario_fob'] = df_sobre_stock_filtrado['stock_actual'] * df_sobre_stock_filtrado['costo']
+    df_sobre_stock_filtrado['cbm_ocupado'] = df_sobre_stock_filtrado['stock_actual'] * (df_sobre_stock_filtrado['CBMM'] / df_sobre_stock_filtrado['cantidad_por_caja'])
+    
+    total_capital_fob = df_sobre_stock_filtrado['valor_inventario_fob'].sum()
+    total_cbm_ocupado = df_sobre_stock_filtrado['cbm_ocupado'].sum()
+    total_skus_inactivos = len(df_sobre_stock_filtrado)
+    total_uds_inactivas = df_sobre_stock_filtrado['stock_actual'].sum()
+    
+    # ── 4. TARJETAS DE INDICADORES (KPI CARDS) ──
+    kpi_col1, kpi_col2, kpi_col3, kpi_col4 = st.columns(4)
+    with kpi_col1:
+        st.markdown(f"""
+        <div class="kpi-card" style="border-left: 4px solid #D9534F;">
+            <div class="kpi-label">CAPITAL INMOVILIZADO (FOB)</div>
+            <div class="kpi-value" style="color: #D9534F;">${total_capital_fob:,.2f}</div>
+        </div>
+        """, unsafe_allow_html=True)
+    with kpi_col2:
+        st.markdown(f"""
+        <div class="kpi-card" style="border-left: 4px solid #F0AD4E;">
+            <div class="kpi-label">VOLUMEN OCUPADO EN BODEGA</div>
+            <div class="kpi-value" style="color: #F0AD4E;">{total_cbm_ocupado:,.2f} m³</div>
+        </div>
+        """, unsafe_allow_html=True)
+    with kpi_col3:
+        st.markdown(f"""
+        <div class="kpi-card" style="border-left: 4px solid #141E32;">
+            <div class="kpi-label">PRODUCTOS (SKUs) SIN MOVIMIENTO</div>
+            <div class="kpi-value" style="color: #141E32;">{total_skus_inactivos:,.0f} uds</div>
+        </div>
+        """, unsafe_allow_html=True)
+    with kpi_col4:
+        st.markdown(f"""
+        <div class="kpi-card" style="border-left: 4px solid #5AA06E;">
+            <div class="kpi-label">EXISTENCIA FÍSICA INACTIVA</div>
+            <div class="kpi-value" style="color: #5AA06E;">{total_uds_inactivas:,.0f} uds</div>
+        </div>
+        """, unsafe_allow_html=True)
+        
+    st.markdown("<br>", unsafe_allow_html=True)
+    
+    # ── 5. TABLA DE DETALLE ──
+    if not df_sobre_stock_filtrado.empty:
+        df_show_t8 = df_sobre_stock_filtrado[['sku', 'nombre', 'categoria', 'stock_actual', 'stock_transito', 'ventas_6m', 'costo', 'valor_inventario_fob', 'cbm_ocupado']].copy()
+        
+        # Ordenar por valor de inventario descendente
+        df_show_t8 = df_show_t8.sort_values('valor_inventario_fob', ascending=False)
+        
+        # Renombrar columnas para visualización clara
+        df_show_t8.columns = [
+            'Código SKU', 'Descripción', 'Categoría', 'Stock Actual', 'En Tránsito', 
+            'Ventas (6 Meses)', 'Costo FOB (Unit)', 'Valor Inventario ($)', 'Volumen Ocupado (m³)'
+        ]
+        
+        st.dataframe(
+            df_show_t8.style.format({
+                'Stock Actual': '{:,.0f}',
+                'En Tránsito': '{:,.0f}',
+                'Ventas (6 Meses)': '{:,.0f}',
+                'Costo FOB (Unit)': '${:,.2f}',
+                'Valor Inventario ($)': '${:,.2f}',
+                'Volumen Ocupado (m³)': '{:,.3f}'
+            }),
+            use_container_width=True,
+            height=400
+        )
+        
+        # Botón de Descarga
+        csv_t8 = df_sobre_stock_filtrado.to_csv(index=False, encoding='utf-8-sig')
+        st.download_button(
+            label="Descargar Reporte de Sobre Stock (CSV)",
+            data=csv_t8,
+            file_name="reporte_sobre_stock_muerto.csv",
+            mime="text/csv",
+            key="btn_descarga_t8"
+        )
+    else:
+        st.info("No se encontraron productos que coincidan con los criterios seleccionados.")
 
 # Footer Masshopping
 st.markdown("""
