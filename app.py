@@ -3,6 +3,8 @@ import pandas as pd
 import numpy as np
 import math
 import os
+import datetime
+import requests
 from scipy import stats
 import plotly.graph_objects as go
 import plotly.express as px
@@ -11,7 +13,7 @@ from plotly.subplots import make_subplots
 # Configuracion de pagina Masshopping
 st.set_page_config(
     page_title="Masshopping Admin | Planificador Logistico & Contenedores",
-    page_icon="Masshoping_logo.png" if os.path.exists("Masshoping_logo.png") else "\U0001F4E6",
+    page_icon=os.path.join("assets", "logo.png") if os.path.exists(os.path.join("assets", "logo.png")) else ("Masshoping_logo.png" if os.path.exists("Masshoping_logo.png") else "\U0001F4E6"),
     layout="wide",
     initial_sidebar_state="expanded"
 )
@@ -202,6 +204,220 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ══════════════════════════════════════════════════════════════════════════════
+# GOOGLE SHEETS SCHEMA & DIALOG MODAL
+# ══════════════════════════════════════════════════════════════════════════════
+GOOGLE_SHEET_WEBHOOK_URL = "https://script.google.com/macros/s/AKfycbwPxrh1w7_6oOYgrKS5TJQ9HECimcSsVOUNsAADd1voEvEEiOiON0_kFCHxY3e_SLrc/exec"
+
+def construir_df_intermedio_gsheet(df_sel, flete_cbm_val=500.0, df_catalogo=None):
+    """
+    Construye el DataFrame Intermedio adaptado exactamente al Schema de Google Sheets (31 columnas):
+    ['CODIGO', 'FOTO', 'PRODUCTO', 'CANTIDAD', 'COSTO', 'CANTIDAD POR CAJA',
+     'CANTIDAD DE CAJAS', 'CM_A', 'CM_L', 'CM_P', 'CBM', 'TOTAL CBM',
+     'COSTO CAJA', 'COSTO TOTAL ENVIO', 'COSTO ENVIO UNIT',
+     'COSTO UNITARIO PROD', 'COSTO TOTAL', 'VENTA MAYOR', 'GANANCIA MAYOR',
+     'GANANCIA MAYOR %', 'GANANCIA TOTAL MAYOR', 'MARGEN SEDE',
+     'MARGEN ESTE', '% TASA', 'COMI_CASHEA', 'COMI_MELI', 'COSTO CASHEA',
+     'VENTA CASHEA', 'GANANCIA CASHEA', 'GANANCIA CASHEA %',
+     'GANANCIA TOTAL']
+    """
+    df_work = df_sel.copy()
+    
+    # Si faltan cm_a, cm_l, cm_p en df_sel, unirlas desde el catalogo general si está disponible
+    if df_catalogo is not None and not df_catalogo.empty:
+        cols_missing = [c for c in ['cm_a', 'cm_l', 'cm_p'] if c not in df_work.columns and c in df_catalogo.columns]
+        if cols_missing:
+            df_work = pd.merge(df_work, df_catalogo[['sku'] + cols_missing].drop_duplicates('sku'), on='sku', how='left')
+
+    df_out = pd.DataFrame(index=df_work.index)
+    
+    def get_series_num(df, col, default=0.0):
+        if col in df.columns:
+            return pd.to_numeric(df[col], errors='coerce').fillna(default)
+        return pd.Series(default, index=df.index)
+
+    def get_series_str(df, col, default=''):
+        if col in df.columns:
+            return df[col].fillna(default).astype(str).str.strip()
+        return pd.Series(default, index=df.index)
+
+    # 1. CODIGO
+    df_out['CODIGO'] = get_series_str(df_work, 'sku', '')
+    
+    # 2. FOTO
+    df_out['FOTO'] = get_series_str(df_work, 'imagen_url', '')
+    
+    # 3. PRODUCTO
+    df_out['PRODUCTO'] = get_series_str(df_work, 'nombre', 'Sin Nombre')
+    
+    # Cantidades base
+    cajas = get_series_num(df_work, 'pedir_cajas', 0).astype(int)
+    uds_caja = get_series_num(df_work, 'cantidad_por_caja', 1).clip(lower=1).astype(int)
+    total_uds = cajas * uds_caja
+    costo_fob = get_series_num(df_work, 'costo', 0.0)
+    
+    # 4. CANTIDAD (Total Uds)
+    df_out['CANTIDAD'] = total_uds
+    
+    # 5. COSTO (FOB Unit)
+    df_out['COSTO'] = np.where(costo_fob > 0, costo_fob.round(2), '')
+    
+    # 6. CANTIDAD POR CAJA
+    df_out['CANTIDAD POR CAJA'] = uds_caja
+    
+    # 7. CANTIDAD DE CAJAS
+    df_out['CANTIDAD DE CAJAS'] = cajas
+    
+    # Dimensiones
+    cm_a = get_series_num(df_work, 'cm_a', 0.0)
+    cm_l = get_series_num(df_work, 'cm_l', 0.0)
+    cm_p = get_series_num(df_work, 'cm_p', 0.0)
+    
+    # 8. CM_A, 9. CM_L, 10. CM_P (si no existen, dejar en blanco)
+    df_out['CM_A'] = np.where(cm_a > 0, cm_a.round(1), '')
+    df_out['CM_L'] = np.where(cm_l > 0, cm_l.round(1), '')
+    df_out['CM_P'] = np.where(cm_p > 0, cm_p.round(1), '')
+    
+    # 11. CBM (por caja) - Si falta CBM pero hay dimensiones cm, calcularlo. Si falta todo, fallback 0.05
+    cbm_raw = get_series_num(df_work, 'CBMM', 0.0)
+    cbm_calc = np.where((cbm_raw <= 0) & (cm_a > 0) & (cm_l > 0) & (cm_p > 0), (cm_a * cm_l * cm_p) / 1000000.0, cbm_raw)
+    cbm_final = np.where(cbm_calc > 0, cbm_calc, 0.05)
+    df_out['CBM'] = np.round(cbm_final, 4)
+    
+    # 12. TOTAL CBM
+    total_cbm = cajas * cbm_final
+    df_out['TOTAL CBM'] = np.round(total_cbm, 4)
+    
+    # 13. COSTO CAJA
+    costo_caja = costo_fob * uds_caja
+    df_out['COSTO CAJA'] = np.where(costo_caja > 0, costo_caja.round(2), '')
+    
+    # 14. COSTO TOTAL ENVIO
+    costo_total_envio = total_cbm * float(flete_cbm_val)
+    df_out['COSTO TOTAL ENVIO'] = np.round(costo_total_envio, 2)
+    
+    # 15. COSTO ENVIO UNIT
+    cbm_unit = np.where(uds_caja > 0, cbm_final / uds_caja, 0.0)
+    costo_envio_unit = cbm_unit * float(flete_cbm_val)
+    df_out['COSTO ENVIO UNIT'] = np.round(costo_envio_unit, 2)
+    
+    # 16. COSTO UNITARIO PROD (DDP)
+    costo_unit_prod = np.where(costo_fob > 0, costo_fob + costo_envio_unit, costo_envio_unit)
+    df_out['COSTO UNITARIO PROD'] = np.where(costo_unit_prod > 0, np.round(costo_unit_prod, 2), '')
+    
+    # 17. COSTO TOTAL (Total DDP)
+    costo_total = total_uds * costo_unit_prod
+    df_out['COSTO TOTAL'] = np.where(costo_total > 0, np.round(costo_total, 2), '')
+    
+    # 18 a 31: Precios de venta, márgenes y comisiones
+    # Dejados en blanco ("") para llenado o fórmulas en Google Sheets
+    df_out['VENTA MAYOR'] = ''
+    df_out['GANANCIA MAYOR'] = ''
+    df_out['GANANCIA MAYOR %'] = ''
+    df_out['GANANCIA TOTAL MAYOR'] = ''
+    df_out['MARGEN SEDE'] = ''
+    df_out['MARGEN ESTE'] = ''
+    df_out['% TASA'] = ''
+    df_out['COMI_CASHEA'] = ''
+    df_out['COMI_MELI'] = ''
+    df_out['COSTO CASHEA'] = ''
+    df_out['VENTA CASHEA'] = ''
+    df_out['GANANCIA CASHEA'] = ''
+    df_out['GANANCIA CASHEA %'] = ''
+    df_out['GANANCIA TOTAL'] = ''
+    
+    columnas_schema = [
+        'CODIGO', 'FOTO', 'PRODUCTO', 'CANTIDAD', 'COSTO', 'CANTIDAD POR CAJA',
+        'CANTIDAD DE CAJAS', 'CM_A', 'CM_L', 'CM_P', 'CBM', 'TOTAL CBM',
+        'COSTO CAJA', 'COSTO TOTAL ENVIO', 'COSTO ENVIO UNIT',
+        'COSTO UNITARIO PROD', 'COSTO TOTAL', 'VENTA MAYOR', 'GANANCIA MAYOR',
+        'GANANCIA MAYOR %', 'GANANCIA TOTAL MAYOR', 'MARGEN SEDE',
+        'MARGEN ESTE', '% TASA', 'COMI_CASHEA', 'COMI_MELI', 'COSTO CASHEA',
+        'VENTA CASHEA', 'GANANCIA CASHEA', 'GANANCIA CASHEA %',
+        'GANANCIA TOTAL'
+    ]
+    return df_out[columnas_schema]
+
+@st.dialog("🚢 Asignar Productos a Contenedor en Google Sheets", width="large")
+def modal_asignar_contenedor_gsheet(df_sel, flete_cbm_val=500.0, df_catalogo=None):
+    df_intermedio = construir_df_intermedio_gsheet(df_sel, flete_cbm_val, df_catalogo)
+    
+    st.markdown(f"Estás a punto de exportar **{len(df_intermedio)} productos seleccionados** estructurados con el **Schema oficial de Google Sheets (31 Columnas)**.")
+    
+    cajas_tot = int(pd.to_numeric(df_intermedio['CANTIDAD DE CAJAS'], errors='coerce').fillna(0).sum())
+    cbm_tot = float(pd.to_numeric(df_intermedio['TOTAL CBM'], errors='coerce').fillna(0.0).sum())
+    
+    # Calcular costo FOB y DDP total numéricos
+    fob_calc = pd.to_numeric(df_intermedio['CANTIDAD'], errors='coerce').fillna(0) * pd.to_numeric(df_intermedio['COSTO'], errors='coerce').fillna(0.0)
+    fob_tot = float(fob_calc.sum())
+    ddp_tot = float(pd.to_numeric(df_intermedio['COSTO TOTAL'], errors='coerce').fillna(0.0).sum())
+    
+    col_k1, col_k2, col_k3, col_k4 = st.columns(4)
+    with col_k1:
+        st.metric("Total Cajas", f"{cajas_tot:,}")
+    with col_k2:
+        st.metric("Volumen CBM", f"{cbm_tot:,.2f} m³")
+    with col_k3:
+        st.metric("Inversión FOB", f"${fob_tot:,.2f}")
+    with col_k4:
+        st.metric("Costo Total DDP", f"${ddp_tot:,.2f}")
+    
+    st.markdown("---")
+    contenedor_nombre = st.text_input(
+        "Nombre de la Pestaña / Contenedor en Google Sheets:",
+        placeholder="Ej: Contenedor Moscú, Egipto Julio, etc.",
+        key="input_nombre_contenedor_modal"
+    )
+    
+    st.caption("📋 Vista previa del DataFrame Intermedio a exportar (31 Columnas):")
+    st.dataframe(
+        df_intermedio,
+        column_config={
+            "FOTO": st.column_config.ImageColumn("Foto", help="Foto del producto"),
+            "COSTO": st.column_config.NumberColumn("Costo FOB ($)", format="$%.2f"),
+            "CBM": st.column_config.NumberColumn("CBM/Caja", format="%.3f"),
+            "TOTAL CBM": st.column_config.NumberColumn("Total CBM", format="%.3f"),
+            "COSTO CAJA": st.column_config.NumberColumn("Costo Caja ($)", format="$%.2f"),
+            "COSTO TOTAL ENVIO": st.column_config.NumberColumn("Flete Total ($)", format="$%.2f"),
+            "COSTO ENVIO UNIT": st.column_config.NumberColumn("Flete Unit ($)", format="$%.2f"),
+            "COSTO UNITARIO PROD": st.column_config.NumberColumn("Costo DDP ($)", format="$%.2f"),
+            "COSTO TOTAL": st.column_config.NumberColumn("Costo Total DDP ($)", format="$%.2f"),
+        },
+        use_container_width=True,
+        height=260
+    )
+    
+    if st.button("🚀 Confirmar y Cargar a Google Sheets (31 Columnas)", type="primary", use_container_width=True):
+        if not contenedor_nombre or not contenedor_nombre.strip():
+            st.error("⚠️ Por favor ingresa un nombre para el contenedor u hoja.")
+            return
+        
+        with st.spinner(f"Escribiendo {len(df_intermedio)} productos en la hoja '{contenedor_nombre.strip()}'..."):
+            filas_para_enviar = df_intermedio.fillna('').values.tolist()
+            payload = {
+                "container": contenedor_nombre.strip(),
+                "headers": list(df_intermedio.columns),
+                "items": filas_para_enviar
+            }
+            
+            try:
+                res = requests.post(GOOGLE_SHEET_WEBHOOK_URL, json=payload, timeout=30)
+                if res.status_code == 200:
+                    try:
+                        res_json = res.json()
+                        if res_json.get("status") == "success":
+                            st.session_state['gsheet_success_msg'] = f"✅ ¡Éxito! Se registraron {len(filas_para_enviar)} productos con 31 columnas en la pestaña '{contenedor_nombre.strip()}' de Google Sheets."
+                            st.rerun()
+                        else:
+                            st.error(f"Error devuelto por Google: {res_json.get('message')}")
+                    except Exception:
+                        st.session_state['gsheet_success_msg'] = f"✅ ¡Éxito! Se registraron {len(filas_para_enviar)} productos con 31 columnas en la pestaña '{contenedor_nombre.strip()}' de Google Sheets."
+                        st.rerun()
+                else:
+                    st.error(f"Error en servidor Google (Status {res.status_code}): {res.text}")
+            except Exception as ex:
+                st.error(f"Error de conexión: {ex}")
+
+# ══════════════════════════════════════════════════════════════════════════════
 # 1. FUNCION DE LIMPIEZA DE TEXTO (CORRIGE MOJIBAKE EN TILDES Y N)
 # ══════════════════════════════════════════════════════════════════════════════
 def limpiar_mojibake(texto):
@@ -223,14 +439,29 @@ def limpiar_mojibake(texto):
     return texto
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 2. CARGA DE DATOS EN CACHE
+# 2. CARGA DE DATOS EN CACHE (DESDE data/)
 # ══════════════════════════════════════════════════════════════════════════════
-@st.cache_data(show_spinner="Cargando base de datos Masshopping...")
-def cargar_datos_base():
-    # 1. Transacciones
-    reports = [i + 4 for i in range(12)]
-    df_temp = [pd.read_csv(f"reporte ({r}).csv", encoding="latin1", low_memory=False) for r in reports]
-    df_trans = pd.concat(df_temp, ignore_index=True)
+def obtener_ruta_data(nombre_archivo):
+    """Busca el archivo en data/ primero, y luego en la raíz como fallback."""
+    ruta_data = os.path.join('data', nombre_archivo)
+    if os.path.exists(ruta_data):
+        return ruta_data
+    return nombre_archivo
+
+@st.cache_data(show_spinner="Cargando base de datos consolidada Masshopping...")
+def cargar_datos_base(mtime_ventas=0.0, mtime_art=0.0, mtime_cons=0.0):
+    # 1. Transacciones unificadas
+    ruta_ventas = obtener_ruta_data('ventas.csv')
+    if os.path.exists(ruta_ventas):
+        try:
+            df_trans = pd.read_csv(ruta_ventas, encoding='utf-8-sig', low_memory=False)
+        except Exception:
+            df_trans = pd.read_csv(ruta_ventas, encoding='latin1', low_memory=False)
+    else:
+        # Fallback a reportes individuales si existieran
+        reports = [i + 4 for i in range(12)]
+        dfs = [pd.read_csv(f"reporte ({r}).csv", encoding="latin1", low_memory=False) for r in reports if os.path.exists(f"reporte ({r}).csv")]
+        df_trans = pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
     
     col_art = [c for c in df_trans.columns if 'digo' in c and 'rt' in c][0]
     col_fecha = [c for c in df_trans.columns if 'Fecha' in c][0]
@@ -250,10 +481,54 @@ def cargar_datos_base():
     # 2. Extraer fallback de nombres de las transacciones
     df_nombres_trans = df_clean[['sku', 'nombre_trans']].drop_duplicates(subset=['sku'], keep='last')
     
-    # 2b. Articulos (Stock actual, Categoria y Nombre)
-    df_art = pd.read_csv('articulos.csv', encoding='latin1')
+    # 2b. Articulos (Stock actual actualizado desde data/articulos.xlsx)
+    ruta_xlsx = obtener_ruta_data('articulos.xlsx')
+    ruta_art_csv = obtener_ruta_data('articulos.csv')
+    df_art = None
+    if os.path.exists(ruta_xlsx):
+        try:
+            df_art = pd.read_excel(ruta_xlsx)
+        except Exception:
+            pass
+        if df_art is None or df_art.empty:
+            try:
+                import zipfile, xml.etree.ElementTree as ET
+                with zipfile.ZipFile(ruta_xlsx, 'r') as z:
+                    sst = []
+                    if 'xl/sharedStrings.xml' in z.namelist():
+                        sst_root = ET.fromstring(z.read('xl/sharedStrings.xml'))
+                        ns_sst = {'ns': 'http://schemas.openxmlformats.org/spreadsheetml/2006/main'}
+                        for si in sst_root.findall('.//ns:si', ns_sst):
+                            texts = [t.text or '' for t in si.findall('.//ns:t', ns_sst)]
+                            sst.append(''.join(texts))
+                    sheet_path = next((name for name in z.namelist() if name.lower() == 'xl/worksheets/sheet1.xml'), None)
+                    if sheet_path:
+                        root = ET.fromstring(z.read(sheet_path))
+                        ns = {'ns': 'http://schemas.openxmlformats.org/spreadsheetml/2006/main'}
+                        rows = []
+                        for row in root.findall('.//ns:row', ns):
+                            r_vals = []
+                            for c in row.findall('ns:c', ns):
+                                t = c.get('t')
+                                v = c.find('ns:v', ns)
+                                val = v.text if v is not None else ''
+                                if t == 's' and val and val.isdigit():
+                                    idx = int(val)
+                                    val = sst[idx] if idx < len(sst) else val
+                                r_vals.append(val)
+                            if any(r_vals):
+                                rows.append(r_vals)
+                        if rows:
+                            df_art = pd.DataFrame(rows[1:], columns=rows[0])
+            except Exception:
+                pass
+                
+    if df_art is None or df_art.empty:
+        if os.path.exists(ruta_art_csv):
+            df_art = pd.read_csv(ruta_art_csv, encoding='latin1')
+
     col_art_art = [c for c in df_art.columns if 'digo' in c and 'rt' in c][0]
-    col_exist = [c for c in df_art.columns if 'Existencia' in c][0]
+    col_exist = [c for c in df_art.columns if 'Existencia' in c or 'Disponible' in c][0]
     col_nom_art = [c for c in df_art.columns if ('rt' in c or 'culo' in c) and 'digo' not in c][0]
     col_cat = [c for c in df_art.columns if 'teg' in c.lower() and 'digo' not in c.lower()][0]
     
@@ -264,45 +539,57 @@ def cargar_datos_base():
     df_art_clean['stock_actual'] = pd.to_numeric(df_art_clean['stock_actual'].astype(str).str.replace(',', ''), errors='coerce').fillna(0.0)
     df_art_clean['nombre_articulo'] = df_art_clean['nombre_articulo'].astype(str).apply(limpiar_mojibake)
     df_art_clean['categoria'] = df_art_clean['categoria'].fillna('GENERAL').astype(str).str.strip()
-    df_art_clean = df_art_clean.drop_duplicates(subset=['sku'], keep='last')
+    
+    # Agrupar por SKU sumando el stock actual si hay múltiples ubicaciones/lotes
+    df_art_clean = df_art_clean.groupby('sku', as_index=False).agg({
+        'stock_actual': 'sum',
+        'nombre_articulo': 'first',
+        'categoria': 'first'
+    })
     df_art_clean = df_art_clean[df_art_clean['sku'] != 'MASS1575']
     
-    # 3. Metadata logistica + Stock en Transito
-    df_cons = pd.read_csv('consolidado.csv', encoding='latin1')
+    # 3. Metadata logistica + Stock en Transito (desde data/consolidado.csv)
+    ruta_cons = obtener_ruta_data('consolidado.csv')
+    df_cons = pd.read_csv(ruta_cons, encoding='latin1')
     
     # Extraer stock en transito (CONTENEDORES JULIO + CONTENEDOR EGIPTO)
     contenedores_transito = ['CONTENEDORES JULIO', 'CONTENEDOR EGIPTO']
     df_transit = df_cons[df_cons['contenedor'].isin(contenedores_transito)].copy()
     df_transit['codigo'] = df_transit['codigo'].astype(str).str.strip()
     df_transit['cantidad'] = pd.to_numeric(df_transit['cantidad'], errors='coerce').fillna(0)
-    # Explode multi-sku codes (e.g. "MASS2305 MASS2405 MASS2699")
     df_transit_exp = (
         df_transit.assign(sku=df_transit['codigo'].str.split(r'\n|[\n\s]+'))
         .explode('sku').dropna(subset=['sku'])
     )
     df_transit_exp['sku'] = df_transit_exp['sku'].str.strip()
     df_transit_exp = df_transit_exp[df_transit_exp['sku'] != '']
-    # Sum transit quantities per SKU (could be in both containers)
     df_stock_transito = df_transit_exp.groupby('sku')['cantidad'].sum().reset_index()
     df_stock_transito.columns = ['sku', 'stock_transito']
     df_stock_transito = df_stock_transito[df_stock_transito['sku'] != 'MASS1575']
     
-    # Metadata de costos/empaque (todas las filas)
-    df_cons_meta = df_cons[['codigo', 'costo', 'cantidad_por_caja', 'CBMM']].dropna(subset=['codigo'])
+    # Metadata de costos/empaque
+    df_cons_meta = df_cons[['codigo', 'costo', 'cantidad_por_caja', 'CBMM', 'cm_a', 'cm_l', 'cm_p']].dropna(subset=['codigo'])
     df_cons_meta['costo'] = pd.to_numeric(df_cons_meta['costo'].astype(str).str.replace('$', '', regex=False).str.replace(',', ''), errors='coerce')
     df_cons_meta['cantidad_por_caja'] = pd.to_numeric(df_cons_meta['cantidad_por_caja'], errors='coerce')
     df_cons_meta['CBMM'] = pd.to_numeric(df_cons_meta['CBMM'], errors='coerce')
+    df_cons_meta['cm_a'] = pd.to_numeric(df_cons_meta['cm_a'], errors='coerce')
+    df_cons_meta['cm_l'] = pd.to_numeric(df_cons_meta['cm_l'], errors='coerce')
+    df_cons_meta['cm_p'] = pd.to_numeric(df_cons_meta['cm_p'], errors='coerce')
     df_cons_exp = (
         df_cons_meta.assign(sku=df_cons_meta['codigo'].astype(str).str.strip().str.split(r'\n|[\n\s]+'))
         .explode('sku').dropna(subset=['sku'])
     )
     df_cons_exp['sku'] = df_cons_exp['sku'].str.strip()
     df_cons_exp = df_cons_exp[df_cons_exp['sku'] != ''].drop_duplicates(subset=['sku'], keep='last')
-    df_metadata = df_cons_exp[['sku', 'costo', 'cantidad_por_caja', 'CBMM']]
+    df_metadata = df_cons_exp[['sku', 'costo', 'cantidad_por_caja', 'CBMM', 'cm_a', 'cm_l', 'cm_p']]
     df_metadata = df_metadata[df_metadata['sku'] != 'MASS1575']
     
-    # 4. Catalogo de Imagenes y Nombres (IMAGES.csv)
-    df_images = pd.read_csv('IMAGES.csv', encoding='latin1')
+    # 4. Catalogo de Imagenes (desde data/images.csv o IMAGES.csv)
+    ruta_images = obtener_ruta_data('images.csv')
+    if not os.path.exists(ruta_images):
+        ruta_images = obtener_ruta_data('IMAGES.csv')
+        
+    df_images = pd.read_csv(ruta_images, encoding='latin1')
     df_images = df_images[['CODIGO', 'NOMBRE', 'IMAGEN']].rename(
         columns={'CODIGO': 'sku', 'NOMBRE': 'nombre', 'IMAGEN': 'imagen_url'}
     )
@@ -315,15 +602,15 @@ def cargar_datos_base():
     df_info_prod = pd.merge(df_images, df_art_clean[['sku', 'nombre_articulo', 'categoria']], on='sku', how='outer')
     df_info_prod = pd.merge(df_info_prod, df_nombres_trans, on='sku', how='outer')
     
-    # Prioridad: IMAGES -> articulos.csv -> reporte transacciones -> 'Sin Descripcion'
     df_info_prod['nombre_final'] = df_info_prod['nombre'].fillna(df_info_prod['nombre_articulo']).fillna(df_info_prod['nombre_trans']).fillna('Sin Descripcion')
     df_info_prod['nombre'] = df_info_prod['nombre_final'].replace('nan', 'Sin Descripcion')
     df_info_prod['categoria'] = df_info_prod['categoria'].fillna('GENERAL')
     df_info_prod = df_info_prod[['sku', 'nombre', 'categoria', 'imagen_url']]
     
     import json
+    ruta_p2p = obtener_ruta_data('p2p.json')
     try:
-        with open('p2p.json', 'r', encoding='utf-8') as f:
+        with open(ruta_p2p, 'r', encoding='utf-8') as f:
             p2p_data = json.load(f)
         
         dates = pd.to_datetime(p2p_data['categories'])
@@ -334,13 +621,20 @@ def cargar_datos_base():
         df_p2p = df_p2p.sort_values('fecha').drop_duplicates('fecha', keep='last')
         df_p2p['var_pct'] = df_p2p['usd_rate'].pct_change() * 100
         df_p2p['var_pct'] = df_p2p['var_pct'].fillna(0)
-    except Exception as e:
-        # Fallback empty df in case file is missing or structure changes
+    except Exception:
         df_p2p = pd.DataFrame({'fecha': [], 'usd_rate': [], 'var_pct': []})
     
     return df_clean, df_art_clean[['sku', 'stock_actual', 'categoria']], df_metadata, df_info_prod, df_stock_transito, df_p2p
 
-df_trans, df_art, df_metadata, df_info_prod, df_stock_transito, df_p2p = cargar_datos_base()
+# Timestamps de invalidacion de cache
+p_v = obtener_ruta_data('ventas.csv')
+p_a = obtener_ruta_data('articulos.xlsx')
+p_c = obtener_ruta_data('consolidado.csv')
+mtime_ventas = os.path.getmtime(p_v) if os.path.exists(p_v) else 0.0
+mtime_art = os.path.getmtime(p_a) if os.path.exists(p_a) else 0.0
+mtime_cons = os.path.getmtime(p_c) if os.path.exists(p_c) else 0.0
+
+df_trans, df_art, df_metadata, df_info_prod, df_stock_transito, df_p2p = cargar_datos_base(mtime_ventas, mtime_art, mtime_cons)
 
 # Excluir de forma global y permanente el SKU MASS1350 de todo el sistema
 df_trans = df_trans[df_trans['sku'] != 'MASS1350']
@@ -350,10 +644,16 @@ df_art = df_art[df_art['sku'] != 'MASS1350']
 # 3. SIDEBAR CORPORATIVO MASSHOPPING
 # ══════════════════════════════════════════════════════════════════════════════
 with st.sidebar:
-    if os.path.exists("Masshoping_logo.png"):
-        st.image("Masshoping_logo.png", width=170)
+    logo_path = os.path.join('assets', 'logo.png') if os.path.exists(os.path.join('assets', 'logo.png')) else 'Masshoping_logo.png'
+    if os.path.exists(logo_path):
+        st.image(logo_path, width=170)
     st.markdown("### Motor de logística para compras masivas")
     st.caption("Panel de Control y Compras Estratégicas")
+    
+    if st.button("🔄 Recargar Base de Datos (Limpiar Caché)", use_container_width=True, help="Fuerza la recarga de data/ventas.csv y data/articulos.xlsx"):
+        st.cache_data.clear()
+        st.rerun()
+        
     st.divider()
     
     st.subheader("Ventana Temporal de Demanda")
@@ -377,29 +677,33 @@ with st.sidebar:
         df_trans_filtrada = df_trans.copy()
         
     st.divider()
-    st.subheader("Configuración de Pronóstico")
-    opcion_lookback = st.selectbox(
-        "Historial para ROP y EOQ:",
-        ["Últimas 52 semanas (1 año)", "Últimas 26 semanas (6 meses)", "Últimas 12 semanas (3 meses)", "Todo el historial disponible"],
-        key="sidebar_lookback"
+    st.subheader("Configuración de Abastecimiento")
+    lead_time = st.slider(
+        "Tiempo de Entrega / Lead Time (Semanas):",
+        min_value=1,
+        max_value=52,
+        value=15,
+        step=1,
+        help="Tiempo en semanas que tarda el proveedor en entregar el pedido. Modifica dinámicamente la Demanda Esperada en Lead Time y el ROP.",
+        key="sidebar_lead_time"
     )
-    
-    if "52" in opcion_lookback:
-        lookback_weeks = 52
-    elif "26" in opcion_lookback:
-        lookback_weeks = 26
-    elif "12" in opcion_lookback:
-        lookback_weeks = 12
-    else:
-        lookback_weeks = None
+    factor_ss_pct = st.slider(
+        "Margen de Stock de Seguridad (% adicional):",
+        min_value=0,
+        max_value=100,
+        value=0,
+        step=5,
+        help="Por defecto en 0% para no sobrestimar pedidos. Un valor de 0% calcula el ROP exactamente sobre la Demanda Esperada en Lead Time sin colchón adicional.",
+        key="sidebar_factor_ss"
+    )
+    factor_ss = factor_ss_pct / 100.0
     
     st.divider()
     st.subheader("Parámetros del Contenedor")
-    capacidad_cont = st.number_input("Capacidad Contenedor 40HQ (CBM):", value=68.0, step=1.0)
-    flete_cbm = st.number_input("Flete por CBM (USD):", value=500.0, step=5.0)
-    lead_time = st.slider("Lead Time Proveedor (Semanas):", min_value=1, max_value=30, value=15)
-    costo_orden = st.number_input("Costo Administrativo Orden (USD):", value=50.0, step=5.0)
-    tasa_mant = st.slider("Tasa Mantenimiento Inv. (% anual):", min_value=0.05, max_value=0.40, value=0.15, step=0.01)
+    capacidad_cont = st.number_input("Capacidad Contenedor 40HQ (CBM):", value=68.0, step=1.0, key="sidebar_cap_cont")
+    flete_cbm = st.number_input("Flete por CBM (USD):", value=500.0, step=5.0, key="sidebar_flete")
+    costo_orden = st.number_input("Costo Administrativo Orden (USD):", value=50.0, step=5.0, key="sidebar_costo_orden")
+    tasa_mant = st.slider("Tasa Mantenimiento Inv. (% anual):", min_value=0.05, max_value=0.40, value=0.15, step=0.01, key="sidebar_tasa_mant")
     
     st.divider()
     st.caption("Masshopping Supply Chain Portal v3.0")
@@ -408,7 +712,8 @@ with st.sidebar:
 # 4. MOTOR VECTORIZADO DE CALCULO
 # ══════════════════════════════════════════════════════════════════════════════
 @st.cache_data
-def ejecutar_motor(df_t, _df_a, _df_m, _df_info, _df_transit, lt, flete, cap_cont, tasa, c_orden, lookback_weeks):
+def ejecutar_motor(df_t, _df_a, _df_m, _df_info, _df_transit, lt, flete, cap_cont, tasa, c_orden, lookback_weeks=None, factor_ss=0.0):
+    lt = int(lt)
     df_semanal = df_t.groupby(['sku', pd.Grouper(key='fecha', freq='W-MON')])['cantidad'].sum().unstack(fill_value=0.0)
     
     # ── CÁLCULO SKU POR SKU (Alineado con ejecutar_modelo.py) ──
@@ -472,22 +777,35 @@ def ejecutar_motor(df_t, _df_a, _df_m, _df_info, _df_transit, lt, flete, cap_con
             
         mu_incondicional = ts_win.mean()
         
+        # ── AJUSTE POR TENDENCIA Y PICOS DE LANZAMIENTO RECIENTES ──
+        mu_4w = ts_win.iloc[-4:].mean() if len(ts_win) >= 4 else mu_incondicional
+        mu_ewma = ts_win.ewm(span=min(8, len(ts_win))).mean().iloc[-1] if len(ts_win) > 1 else mu_incondicional
+        
+        # Si el producto tiene pocas semanas de historia (<= 12) y su semana inicial fue un pico de lanzamiento (> 2x la media reciente)
+        if len(ts_win) <= 12 and ts_win.iloc[0] > 2.0 * max(mu_4w, 0.1):
+            mu_velocidad = min(mu_ewma, mu_4w)
+        elif mu_4w < mu_incondicional:
+            # Tendencia decreciente: ponderar fuertemente las semanas recientes (70% recientes, 30% histórico)
+            mu_velocidad = 0.7 * mu_4w + 0.3 * mu_incondicional
+        else:
+            mu_velocidad = mu_incondicional
+        
         # SBA
         if cuadrante == 'intermittent' and not np.isnan(cv2):
-            mu_sba = mu_incondicional * (1 - cv2 / 2)
+            mu_sba = mu_velocidad * (1 - cv2 / 2)
             mu_sba = max(0, mu_sba)
         else:
-            mu_sba = mu_incondicional
+            mu_sba = mu_velocidad
             
         demanda_esperada_lt = mu_sba * lt
         
-        # SS empírico para lumpy/intermittent
+        # SS empírico para lumpy/intermittent (escalado por factor_ss)
         if cuadrante in ('lumpy', 'intermittent') and len(ts_win) >= lt:
             rolling_demand = ts_win.rolling(window=lt).sum().dropna()
             errors = rolling_demand - demanda_esperada_lt
-            ss_empirico = max(0, float(np.percentile(errors, percentil_ss)))
+            ss_empirico = max(0.0, float(np.percentile(errors, percentil_ss))) * factor_ss
         else:
-            ss_empirico = 0.0 # Se refinará para Smooth/Erratic después de asignar clase_abc y nivel_servicio
+            ss_empirico = 0.0
             
         rop = demanda_esperada_lt + ss_empirico
         
@@ -497,7 +815,7 @@ def ejecutar_motor(df_t, _df_a, _df_m, _df_info, _df_transit, lt, flete, cap_con
             'adi': adi,
             'cv': cv if not np.isnan(cv) else 0.0,
             'n_pos': n_pos,
-            'demanda_semanal_prom': mu_incondicional,
+            'demanda_semanal_prom': mu_velocidad,
             'demanda_semanal_std': ts_win_slice.std(ddof=1) if len(ts_win_slice) > 1 else 0.0,
             'mu_sba': mu_sba,
             'demanda_esperada_lt': demanda_esperada_lt,
@@ -513,8 +831,10 @@ def ejecutar_motor(df_t, _df_a, _df_m, _df_info, _df_transit, lt, flete, cap_con
         total_unidades=('cantidad', 'sum'),
         costo_unit_trans_prom=('costo_unit_trans', 'mean')
     ).reset_index()
+    ventas['precio_venta_prom'] = np.where(ventas['total_unidades'] > 0, ventas['total_ventas'] / ventas['total_unidades'], 0.0)
     
     df_calc = pd.merge(df_calc, ventas, on='sku', how='left')
+    df_calc['precio_venta_prom'] = df_calc['precio_venta_prom'].fillna(0.0)
     df_calc = pd.merge(df_calc, _df_a[['sku', 'stock_actual']], on='sku', how='left')
     df_calc['stock_actual'] = df_calc['stock_actual'].fillna(0.0)
     
@@ -527,6 +847,9 @@ def ejecutar_motor(df_t, _df_a, _df_m, _df_info, _df_transit, lt, flete, cap_con
     df_calc['costo'] = df_calc['costo'].fillna(df_calc['costo_unit_trans_prom']).replace(0.0, np.nan).fillna(1.0)
     df_calc['cantidad_por_caja'] = pd.to_numeric(df_calc['cantidad_por_caja'], errors='coerce').fillna(1).clip(lower=1).astype(int)
     df_calc['CBMM'] = df_calc['CBMM'].fillna(0.05).clip(lower=0.001)
+    df_calc['cm_a'] = pd.to_numeric(df_calc['cm_a'], errors='coerce').fillna(0.0)
+    df_calc['cm_l'] = pd.to_numeric(df_calc['cm_l'], errors='coerce').fillna(0.0)
+    df_calc['cm_p'] = pd.to_numeric(df_calc['cm_p'], errors='coerce').fillna(0.0)
     
     df_calc = pd.merge(df_calc, _df_info, on='sku', how='left')
     df_calc['nombre'] = df_calc['nombre'].fillna('Sin Nombre')
@@ -558,12 +881,12 @@ def ejecutar_motor(df_t, _df_a, _df_m, _df_info, _df_transit, lt, flete, cap_con
     }
     df_calc['nivel_servicio'] = [ns_map.get((a, x), 0.85) for a, x in zip(df_calc['clase_abc'], df_calc['clase_xyz'])]
     
-    # Recalcular ROP y SS Gaussiano para Smooth/Erratic con Z dinámico
+    # Recalcular ROP y SS Gaussiano para Smooth/Erratic con factor_ss
     mask_gauss = df_calc['cuadrante'].isin(['smooth', 'erratic'])
     z_scores = stats.norm.ppf(df_calc.loc[mask_gauss, 'nivel_servicio'])
     df_calc.loc[mask_gauss, 'ss_empirico'] = np.maximum(
         0.0,
-        z_scores * df_calc.loc[mask_gauss, 'demanda_semanal_std'] * math.sqrt(lt)
+        z_scores * df_calc.loc[mask_gauss, 'demanda_semanal_std'] * math.sqrt(lt) * factor_ss
     )
     df_calc.loc[mask_gauss, 'rop'] = df_calc.loc[mask_gauss, 'demanda_esperada_lt'] + df_calc.loc[mask_gauss, 'ss_empirico']
     
@@ -592,7 +915,7 @@ def ejecutar_motor(df_t, _df_a, _df_m, _df_info, _df_transit, lt, flete, cap_con
     
     return df_calc
 
-df_modelo = ejecutar_motor(df_trans_filtrada, df_art, df_metadata, df_info_prod, df_stock_transito, lead_time, flete_cbm, capacidad_cont, tasa_mant, costo_orden, lookback_weeks)
+df_modelo = ejecutar_motor(df_trans_filtrada, df_art, df_metadata, df_info_prod, df_stock_transito, lead_time, flete_cbm, capacidad_cont, tasa_mant, costo_orden, factor_ss=factor_ss)
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 4.5 MOTOR SECUNDARIO: AGREGACIÓN MENSUAL (Para Fichas Visuales)
@@ -642,7 +965,7 @@ tab1, tab7, tab3, tab4, tab5, tab6, tab2, tab8 = st.tabs([
 # ══════════════════════════════════════════════════════════════════════════════
 with tab1:
     st.markdown("#### Constructor de Pedido para Contenedor Masshopping")
-    st.caption("Filtra el catalogo por categoria, estado o texto. El volumen CBM y el costo FOB se recalculan en tiempo real.")
+    st.caption(f"Filtra el catálogo por categoría, estado o texto. Tiempo de entrega activo: **{lead_time} semanas**. El volumen CBM, el ROP y el costo FOB se recalculan en tiempo real.")
     
     with st.container():
         r1_col1, r1_col2 = st.columns([2.5, 1.5])
@@ -671,19 +994,19 @@ with tab1:
         with r2_col3:
             f_xyz = st.multiselect("Variabilidad XYZ:", ["X", "Y", "Z"], default=["X", "Y", "Z"])
     
-    # Aplicar filtros
-    mask = (
-        df_modelo['estado'].isin(f_estado) &
-        df_modelo['clase_abc'].isin(f_abc) &
-        df_modelo['clase_xyz'].isin(f_xyz) &
-        (~df_modelo['sku'].isin(['MASS3063', 'MASS3065', 'MASS3066']))
-    )
-    if f_categoria:
-        mask = mask & (df_modelo['categoria'].isin(f_categoria))
-        
+    # Aplicar filtros: si se busca un producto específico, mostrarlo directamente
     if busqueda_skus:
         codigos_buscar = [s.split(" -- ")[0] for s in busqueda_skus]
-        mask = mask & (df_modelo['sku'].isin(codigos_buscar))
+        mask = df_modelo['sku'].isin(codigos_buscar)
+    else:
+        mask = (
+            df_modelo['estado'].isin(f_estado) &
+            df_modelo['clase_abc'].isin(f_abc) &
+            df_modelo['clase_xyz'].isin(f_xyz) &
+            (~df_modelo['sku'].isin(['MASS3063', 'MASS3065', 'MASS3066']))
+        )
+        if f_categoria:
+            mask = mask & (df_modelo['categoria'].isin(f_categoria))
     
     df_vista = df_modelo[mask].copy()
     
@@ -783,14 +1106,25 @@ with tab1:
         st.success(f"Contenedor optimizado. Nivel de ocupacion: **{pct_llenado:.1f}%**.")
     
     st.markdown("<br>", unsafe_allow_html=True)
-    csv_pedido = seleccionados[['sku', 'nombre', 'categoria', 'pedir_cajas', 'unidades_total', 'cbm_total', 'costo', 'inversion_fob', 'costo_puesto', 'costo_total_ddp']].to_csv(index=False).encode('utf-8-sig')
-    st.download_button(
-        label="Descargar Orden de Compra Masshopping (CSV)",
-        data=csv_pedido,
-        file_name="orden_compra_masshopping_contenedor.csv",
-        mime="text/csv",
-        use_container_width=True
-    )
+    if 'gsheet_success_msg' in st.session_state:
+        st.success(st.session_state.pop('gsheet_success_msg'))
+        
+    col_btn_csv, col_btn_gsheet = st.columns([1, 1])
+    with col_btn_csv:
+        csv_pedido = seleccionados[['sku', 'nombre', 'categoria', 'pedir_cajas', 'unidades_total', 'cbm_total', 'costo', 'inversion_fob', 'costo_puesto', 'costo_total_ddp']].to_csv(index=False).encode('utf-8-sig')
+        st.download_button(
+            label="📥 Descargar Orden de Compra (CSV)",
+            data=csv_pedido,
+            file_name="orden_compra_masshopping_contenedor.csv",
+            mime="text/csv",
+            use_container_width=True
+        )
+    with col_btn_gsheet:
+        if st.button("🚢 Cargar Seleccionados a Google Sheets", type="primary", use_container_width=True, key="btn_gsheet_tab1"):
+            if seleccionados.empty:
+                st.warning("⚠️ Debes marcar al menos un producto con cajas a pedir (> 0) en la tabla para cargarlo al contenedor.")
+            else:
+                modal_asignar_contenedor_gsheet(seleccionados, flete_cbm, df_modelo)
 
 # ══════════════════════════════════════════════════════════════════════════════
 # TAB 2: MATRIZ ABC-XYZ
@@ -1550,7 +1884,7 @@ with tab7:
         (df_modelo['pedir_cajas'] > 0) &
         (df_modelo['total_unidades'] > 0) &
         (~df_modelo['sku'].isin(['MASS3063', 'MASS3065', 'MASS3066']))
-    ].copy()
+    ].copy().sort_values(by=['stock_actual', 'clase_abc'], ascending=True)
     
     if df_optimo.empty:
         st.success("No hay productos que cumplan los criterios de urgencia extrema en este momento.")
@@ -1594,14 +1928,28 @@ with tab7:
             height=300
         )
         
-        csv_optimo = df_optimo[['sku', 'nombre', 'categoria', 'pedir_cajas', 'costo']].to_csv(index=False).encode('utf-8-sig')
-        st.download_button(
-            label="Descargar Pedido Optimo (CSV)",
-            data=csv_optimo,
-            file_name="pedido_optimo_urgente_AA_A.csv",
-            mime="text/csv",
-            type="primary"
-        )
+        df_optimo_show = df_optimo_show.copy()
+        df_optimo_show['cbm_total'] = df_optimo_show['pedir_cajas'] * df_optimo_show['CBMM']
+        df_optimo_show['unidades_total'] = df_optimo_show['pedir_cajas'] * df_optimo_show['cantidad_por_caja']
+        df_optimo_show['inversion_fob'] = df_optimo_show['unidades_total'] * df_optimo_show['costo']
+        df_optimo_show['costo_total_ddp'] = df_optimo_show['unidades_total'] * df_optimo_show['costo_puesto']
+        
+        col_d1, col_d2 = st.columns([1, 1])
+        with col_d1:
+            csv_optimo = df_optimo_show[['sku', 'nombre', 'clase_abc_xyz', 'stock_actual', 'stock_transito', 'rop', 'pedir_cajas', 'costo']].to_csv(index=False).encode('utf-8-sig')
+            st.download_button(
+                label="📥 Descargar Pedido Óptimo (CSV)",
+                data=csv_optimo,
+                file_name="pedido_optimo.csv",
+                mime="text/csv",
+                use_container_width=True
+            )
+        with col_d2:
+            if st.button("🚢 Cargar Pedido Óptimo a Google Sheets", type="primary", use_container_width=True, key="btn_gsheet_optimo"):
+                if df_optimo_show.empty:
+                    st.warning("⚠️ No hay productos en la vista para exportar.")
+                else:
+                    modal_asignar_contenedor_gsheet(df_optimo_show, flete_cbm, df_modelo)
 
 # ══════════════════════════════════════════════════════════════════════════════
 # TAB 8: SOBRE STOCK Y STOCK MUERTO
@@ -1744,7 +2092,7 @@ with tab8:
         st.download_button(
             label="Descargar Reporte de Sobre Stock (CSV)",
             data=csv_t8,
-            file_name="reporte_sobre_stock_muerto.csv",
+            file_name="reporte_sobre_stock.csv",
             mime="text/csv",
             key="btn_descarga_t8"
         )
