@@ -8,3 +8,5 @@ Este es un sistema en python con streamlit que sirve para optimizar el inventari
 
 Linea 1995 en app.py o alrededor tiene las excepcciones de sku que no se deben mostrar
 en 1989, esta la variable "df_optimo" que debe estar
+
+El codigo MASS2412, Termo Owala Freesip Acero Inoxidable 32oz - Color: Fucsia es un caso muy curioso tuvo demanda en 2025 bastante alta, ahora volvio en agosto con 100 unidades y se han vendido 8 unidades, es decir el 8% en 3 semanas, quiere decir que en aproximadamente y si todo sigue constante en al menos 6 meses se deberian acabar las unidades, pero lo que no es curioso no es eso, es que quizas si habia demanda porque si fue un producto que se vencio pero al no haber existencias simplemente no se tranzaba

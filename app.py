@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -208,6 +209,30 @@ st.markdown("""
 # ══════════════════════════════════════════════════════════════════════════════
 GOOGLE_SHEET_WEBHOOK_URL = "https://script.google.com/macros/s/AKfycbwPxrh1w7_6oOYgrKS5TJQ9HECimcSsVOUNsAADd1voEvEEiOiON0_kFCHxY3e_SLrc/exec"
 
+# ══════════════════════════════════════════════════════════════════════════════
+# CONFIGURACIÓN DE CONTENEDORES EN TRÁNSITO
+# ══════════════════════════════════════════════════════════════════════════════
+# Edita este array para agregar o quitar contenedores considerados en tránsito.
+# El sistema los utilizará para calcular el stock en tránsito y para el autocompletado en Google Sheets.
+CONTENEDORES_TRANSITO = [
+    'CONTENEDORES JULIO',
+    'CONTENEDOR EGIPTO',
+    'CONTENEDOR  REVESTIMIENTO ',
+    'CONTENEDOR REVESTIMIENTO',
+    'CONTENEDOR SEPTIEMBRE'
+]
+
+def obtener_opciones_contenedores_transito():
+    """Devuelve la lista única y limpia de contenedores en tránsito para autocompletado."""
+    vistos = set()
+    res = []
+    for c in CONTENEDORES_TRANSITO:
+        c_clean = c.strip()
+        if c_clean and c_clean not in vistos:
+            vistos.add(c_clean)
+            res.append(c_clean)
+    return res
+
 def construir_df_intermedio_gsheet(df_sel, flete_cbm_val=500.0, df_catalogo=None):
     """
     Construye el DataFrame Intermedio adaptado exactamente al Schema de Google Sheets (31 columnas):
@@ -220,19 +245,26 @@ def construir_df_intermedio_gsheet(df_sel, flete_cbm_val=500.0, df_catalogo=None
      'VENTA CASHEA', 'GANANCIA CASHEA', 'GANANCIA CASHEA %',
      'GANANCIA TOTAL']
     """
-    df_work = df_sel.copy()
+    # Eliminar duplicados por SKU antes de estructurar
+    df_work = df_sel.drop_duplicates(subset=['sku'], keep='first').copy()
     
-    # Si faltan cm_a, cm_l, cm_p en df_sel, unirlas desde el catalogo general si está disponible
+    # Dimensiones y unión con catálogo
+    cols_dims = ['cm_a', 'cm_l', 'cm_p']
     if df_catalogo is not None and not df_catalogo.empty:
-        cols_missing = [c for c in ['cm_a', 'cm_l', 'cm_p'] if c not in df_work.columns and c in df_catalogo.columns]
-        if cols_missing:
-            df_work = pd.merge(df_work, df_catalogo[['sku'] + cols_missing].drop_duplicates('sku'), on='sku', how='left')
+        for c in cols_dims:
+            if c not in df_work.columns:
+                df_work = pd.merge(df_work, df_catalogo[['sku', c]].drop_duplicates('sku'), on='sku', how='left')
+            else:
+                df_work[c] = pd.to_numeric(df_work[c].astype(str).str.replace(',', '', regex=False), errors='coerce').fillna(0.0)
+                cat_vals = df_catalogo[['sku', c]].drop_duplicates('sku').set_index('sku')[c]
+                df_work[c] = np.where(df_work[c] > 0, df_work[c], df_work['sku'].map(cat_vals).fillna(0.0))
 
     df_out = pd.DataFrame(index=df_work.index)
     
     def get_series_num(df, col, default=0.0):
         if col in df.columns:
-            return pd.to_numeric(df[col], errors='coerce').fillna(default)
+            s = df[col].astype(str).str.replace('$', '', regex=False).str.replace(',', '', regex=False).str.strip()
+            return pd.to_numeric(s, errors='coerce').fillna(default)
         return pd.Series(default, index=df.index)
 
     def get_series_str(df, col, default=''):
@@ -271,43 +303,43 @@ def construir_df_intermedio_gsheet(df_sel, flete_cbm_val=500.0, df_catalogo=None
     cm_a = get_series_num(df_work, 'cm_a', 0.0)
     cm_l = get_series_num(df_work, 'cm_l', 0.0)
     cm_p = get_series_num(df_work, 'cm_p', 0.0)
+    
+    # REGLA ESTRICTA: Solo si tiene las 3 dimensiones (cm_a, cm_l, cm_p) mayores a 0 es válido
     has_dims = (cm_a > 0) & (cm_l > 0) & (cm_p > 0)
     
-    # 8. CM_A, 9. CM_L, 10. CM_P (si no existen, dejar estrictamente en blanco "")
-    df_out['CM_A'] = np.where(cm_a > 0, cm_a.round(1), '')
-    df_out['CM_L'] = np.where(cm_l > 0, cm_l.round(1), '')
-    df_out['CM_P'] = np.where(cm_p > 0, cm_p.round(1), '')
+    # 8. CM_A, 9. CM_L, 10. CM_P (Si NO tiene las 3 dimensiones completas, dejar en blanco "")
+    df_out['CM_A'] = np.where(has_dims, cm_a.round(1), '')
+    df_out['CM_L'] = np.where(has_dims, cm_l.round(1), '')
+    df_out['CM_P'] = np.where(has_dims, cm_p.round(1), '')
     
-    # 11. CBM (por caja) - Si existe CBMM > 0 o dimensiones completas, calcularlo. Si no existe, dejar estrictamente en blanco ("")
-    cbm_raw = get_series_num(df_work, 'CBMM', 0.0)
-    cbm_calc = np.where(cbm_raw > 0, cbm_raw, np.where(has_dims, (cm_a * cm_l * cm_p) / 1000000.0, 0.0))
-    has_cbm = cbm_calc > 0
-    df_out['CBM'] = np.where(has_cbm, np.round(cbm_calc, 4), '')
+    # 11. CBM (por caja) - Calculado únicamente a partir de CM. Si NO tiene CM, dejar estrictamente en blanco ("")
+    cbm_calc = np.where(has_dims, (cm_a * cm_l * cm_p) / 1000000.0, 0.0)
+    df_out['CBM'] = np.where(has_dims & (cbm_calc > 0), np.round(cbm_calc, 4), '')
     
-    # 12. TOTAL CBM (si no hay CBM válido, en blanco)
-    total_cbm = np.where(has_cbm, cajas * cbm_calc, 0.0)
-    df_out['TOTAL CBM'] = np.where(has_cbm & (total_cbm > 0), np.round(total_cbm, 4), '')
+    # 12. TOTAL CBM (Si NO tiene CM, dejar estrictamente en blanco "")
+    total_cbm = np.where(has_dims, cajas * cbm_calc, 0.0)
+    df_out['TOTAL CBM'] = np.where(has_dims & (total_cbm > 0), np.round(total_cbm, 4), '')
     
-    # 13. COSTO CAJA (Costo FOB * Uds por caja)
-    costo_caja = costo_fob * uds_caja
-    df_out['COSTO CAJA'] = np.where(costo_fob > 0, costo_caja.round(2), '')
+    # 13. COSTO CAJA (Si NO tiene CM, dejar estrictamente en blanco "")
+    costo_caja = np.where(has_dims & (costo_fob > 0), costo_fob * uds_caja, 0.0)
+    df_out['COSTO CAJA'] = np.where(has_dims & (costo_caja > 0), np.round(costo_caja, 2), '')
     
-    # 14. COSTO TOTAL ENVIO (si no hay CBM, en blanco)
-    costo_total_envio = np.where(has_cbm, total_cbm * float(flete_cbm_val), 0.0)
-    df_out['COSTO TOTAL ENVIO'] = np.where(has_cbm & (costo_total_envio > 0), np.round(costo_total_envio, 2), '')
+    # 14. COSTO TOTAL ENVIO (Si NO tiene CM, dejar estrictamente en blanco "")
+    costo_total_envio = np.where(has_dims, total_cbm * float(flete_cbm_val), 0.0)
+    df_out['COSTO TOTAL ENVIO'] = np.where(has_dims & (costo_total_envio > 0), np.round(costo_total_envio, 2), '')
     
-    # 15. COSTO ENVIO UNIT (si no hay CBM, en blanco)
-    cbm_unit = np.where(has_cbm & (uds_caja > 0), cbm_calc / uds_caja, 0.0)
-    costo_envio_unit = np.where(has_cbm & (uds_caja > 0), cbm_unit * float(flete_cbm_val), 0.0)
-    df_out['COSTO ENVIO UNIT'] = np.where(has_cbm & (costo_envio_unit > 0), np.round(costo_envio_unit, 2), '')
+    # 15. COSTO ENVIO UNIT (Si NO tiene CM, dejar estrictamente en blanco "")
+    cbm_unit = np.where(has_dims & (uds_caja > 0), cbm_calc / uds_caja, 0.0)
+    costo_envio_unit = np.where(has_dims & (uds_caja > 0), cbm_unit * float(flete_cbm_val), 0.0)
+    df_out['COSTO ENVIO UNIT'] = np.where(has_dims & (costo_envio_unit > 0), np.round(costo_envio_unit, 2), '')
     
-    # 16. COSTO UNITARIO PROD (DDP) (si no hay CBM, en blanco)
-    costo_unit_prod = np.where(has_cbm & (costo_fob > 0), costo_fob + costo_envio_unit, 0.0)
-    df_out['COSTO UNITARIO PROD'] = np.where(has_cbm & (costo_unit_prod > 0), np.round(costo_unit_prod, 2), '')
+    # 16. COSTO UNITARIO PROD (DDP) (Si NO tiene CM, dejar estrictamente en blanco "")
+    costo_unit_prod = np.where(has_dims & (costo_fob > 0), costo_fob + costo_envio_unit, 0.0)
+    df_out['COSTO UNITARIO PROD'] = np.where(has_dims & (costo_unit_prod > 0), np.round(costo_unit_prod, 2), '')
     
-    # 17. COSTO TOTAL (Total DDP) (si no hay CBM, en blanco)
-    costo_total = np.where(has_cbm & (total_uds > 0) & (costo_unit_prod > 0), total_uds * costo_unit_prod, 0.0)
-    df_out['COSTO TOTAL'] = np.where(has_cbm & (costo_total > 0), np.round(costo_total, 2), '')
+    # 17. COSTO TOTAL (Total DDP) (Si NO tiene CM, dejar estrictamente en blanco "")
+    costo_total = np.where(has_dims & (total_uds > 0) & (costo_unit_prod > 0), total_uds * costo_unit_prod, 0.0)
+    df_out['COSTO TOTAL'] = np.where(has_dims & (costo_total > 0), np.round(costo_total, 2), '')
     
     # 18 a 31: Precios de venta, márgenes y comisiones
     # Dejados en blanco ("") para llenado o fórmulas en Google Sheets
@@ -338,9 +370,22 @@ def construir_df_intermedio_gsheet(df_sel, flete_cbm_val=500.0, df_catalogo=None
     ]
     return df_out[columnas_schema]
 
+def registrar_skus_subidos(skus_lista):
+    if 'skus_enviados_gsheet' not in st.session_state:
+        st.session_state['skus_enviados_gsheet'] = set()
+    for s in skus_lista:
+        s_str = str(s).strip()
+        if s_str:
+            st.session_state['skus_enviados_gsheet'].add(s_str)
+
 def reset_seleccion_estado():
-    for k in ['editor_masshopping_cont', 'editor_pedido_optimo_tab7', 'chk_seleccionar_todos_opt', 'chk_seleccionar_todos_t1']:
-        if k in st.session_state:
+    st.session_state['v_editor_t1'] = st.session_state.get('v_editor_t1', 0) + 1
+    st.session_state['v_editor_t7'] = st.session_state.get('v_editor_t7', 0) + 1
+    st.session_state['chk_seleccionar_todos_opt'] = False
+    st.session_state['chk_seleccionar_todos_t1'] = False
+    st.session_state.pop('select_contenedor_gsheet_modal', None)
+    for k in list(st.session_state.keys()):
+        if k.startswith('editor_masshopping_cont') or k.startswith('editor_pedido_optimo'):
             del st.session_state[k]
 
 @st.dialog("🚢 Asignar Productos a Contenedor en Google Sheets", width="large")
@@ -368,10 +413,16 @@ def modal_asignar_contenedor_gsheet(df_sel, flete_cbm_val=500.0, df_catalogo=Non
         st.metric("Costo Total DDP", f"${ddp_tot:,.2f}")
     
     st.markdown("---")
-    contenedor_nombre = st.text_input(
-        "Nombre de la Pestaña / Contenedor en Google Sheets:",
-        placeholder="Ej: Contenedor Moscú, Egipto Julio, etc.",
-        key="input_nombre_contenedor_modal"
+    lista_transito = obtener_opciones_contenedores_transito()
+
+    contenedor_nombre = st.selectbox(
+        "Nombre de la Pestaña / Contenedor en Google Sheets (Autocompletado):",
+        options=lista_transito,
+        index=None,
+        placeholder="Escribe o selecciona el contenedor (ej: CONTENEDOR EGIPTO, CONTENEDORES JULIO, etc.)...",
+        accept_new_options=True,
+        key="select_contenedor_gsheet_modal",
+        help="Escribe para buscar y autocompletar entre los contenedores en tránsito, o escribe un nombre nuevo y presiona Enter."
     )
     
     st.caption("📋 Vista previa del DataFrame Intermedio a exportar (31 Columnas):")
@@ -393,17 +444,19 @@ def modal_asignar_contenedor_gsheet(df_sel, flete_cbm_val=500.0, df_catalogo=Non
     )
     
     if st.button("🚀 Confirmar y Cargar a Google Sheets (31 Columnas)", type="primary", use_container_width=True):
-        if not contenedor_nombre or not contenedor_nombre.strip():
-            st.error("⚠️ Por favor ingresa un nombre para el contenedor u hoja.")
-            return
+        nombre_final = str(contenedor_nombre).strip() if contenedor_nombre and str(contenedor_nombre).strip() else "Contenedor_Nuevo"
         
-        with st.spinner(f"Escribiendo {len(df_intermedio)} productos en la hoja '{contenedor_nombre.strip()}'..."):
+        with st.spinner(f"Escribiendo {len(df_intermedio)} productos en la hoja '{nombre_final}'..."):
             df_enviar = df_intermedio.copy()
             # Formatear la columna FOTO con la fórmula =IMAGE("url") para renderizar la imagen directamente en Google Sheets
             df_enviar['FOTO'] = df_enviar['FOTO'].apply(lambda x: f'=IMAGE("{x}")' if isinstance(x, str) and str(x).strip().startswith('http') else x)
+            # Formatear la columna G (CANTIDAD DE CAJAS) con fórmula dinámica por fila: CANTIDAD (D) / CANTIDAD POR CAJA (F)
+            # Usa ROW() para que se adapte automáticamente al número de fila real donde se inserte en Google Sheets
+            df_enviar['CANTIDAD DE CAJAS'] = '=INDIRECT("D" & ROW()) / INDIRECT("F" & ROW())'
             filas_para_enviar = df_enviar.fillna('').values.tolist()
             payload = {
-                "container": contenedor_nombre.strip(),
+                "container": nombre_final,
+                "flete_cbm": float(flete_cbm_val),
                 "headers": list(df_intermedio.columns),
                 "items": filas_para_enviar
             }
@@ -411,17 +464,18 @@ def modal_asignar_contenedor_gsheet(df_sel, flete_cbm_val=500.0, df_catalogo=Non
             try:
                 res = requests.post(GOOGLE_SHEET_WEBHOOK_URL, json=payload, timeout=120)
                 if res.status_code == 200:
+                    skus_subidos_actual = df_intermedio['CODIGO'].dropna().astype(str).tolist()
+                    registrar_skus_subidos(skus_subidos_actual)
+                    reset_seleccion_estado()
                     try:
                         res_json = res.json()
                         if res_json.get("status") == "success":
-                            st.session_state['gsheet_success_msg'] = f"✅ ¡Éxito! Se registraron {len(filas_para_enviar)} productos con 31 columnas en la pestaña '{contenedor_nombre.strip()}' de Google Sheets."
-                            reset_seleccion_estado()
+                            st.session_state['gsheet_success_msg'] = f"✅ ¡Éxito! Se registraron {len(filas_para_enviar)} productos con 31 columnas en la pestaña '{nombre_final}' de Google Sheets. (Los artículos se han retirado de la lista para evitar duplicados)."
                             st.rerun()
                         else:
                             st.error(f"Error devuelto por Google: {res_json.get('message')}")
                     except Exception:
-                        st.session_state['gsheet_success_msg'] = f"✅ ¡Éxito! Se registraron {len(filas_para_enviar)} productos con 31 columnas en la pestaña '{contenedor_nombre.strip()}' de Google Sheets."
-                        reset_seleccion_estado()
+                        st.session_state['gsheet_success_msg'] = f"✅ ¡Éxito! Se registraron {len(filas_para_enviar)} productos con 31 columnas en la pestaña '{nombre_final}' de Google Sheets. (Los artículos se han retirado de la lista para evitar duplicados)."
                         st.rerun()
                 else:
                     st.error(f"Error en servidor Google (Status {res.status_code}): {res.text}")
@@ -429,25 +483,44 @@ def modal_asignar_contenedor_gsheet(df_sel, flete_cbm_val=500.0, df_catalogo=Non
                 st.error(f"Error de conexión: {ex}")
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 1. FUNCION DE LIMPIEZA DE TEXTO (CORRIGE MOJIBAKE EN TILDES Y N)
+# 1. FUNCION DE LIMPIEZA DE TEXTO (CORRIGE MOJIBAKE EN TILDES Y CARACTERES ESPECIALES)
 # ══════════════════════════════════════════════════════════════════════════════
 def limpiar_mojibake(texto):
-    if not isinstance(texto, str):
+    if not isinstance(texto, str) or not texto.strip():
         return ''
-    if any(m in texto for m in ['Ã¡', 'Ã©', 'Ã\xad', 'Ã³', 'Ãº', 'Ã±', 'Ã\xad', 'Ã\x81', 'Ã\x89', 'Ã\x8d', 'Ã\x93', 'Ã\x9a', 'Ã\x91', 'Â']):
-        try:
-            return texto.encode('latin1').decode('utf-8')
-        except Exception:
-            pass
+    # Desenredar capas sucesivas de doble/triple mojibake (ej: utf-8 interpretado como latin1 o cp1252)
+    for _ in range(3):
+        if any(m in texto for m in ['Ã', 'Â', 'â', 'ã', '\x83', '\xc3', 'ï¿½']):
+            try:
+                cand = texto.encode('latin1').decode('utf-8')
+                texto = cand
+            except (UnicodeEncodeError, UnicodeDecodeError):
+                try:
+                    cand = texto.encode('cp1252').decode('utf-8')
+                    texto = cand
+                except (UnicodeEncodeError, UnicodeDecodeError):
+                    break
+        else:
+            break
+            
+    # Mapeo específico de remanentes o combinaciones conocidas para mantener tildes y símbolos correctos
     reemplazos = {
-        'Ã¡': 'a', 'Ã©': 'e', 'Ã\xad': 'i', 'Ã³': 'o', 'Ãº': 'u',
-        'Ã\x81': 'A', 'Ã\x89': 'E', 'Ã\x8d': 'I',
-        'Ã\x93': 'O', 'Ã\x9a': 'U', 'Ã±': 'n', 'Ã\x91': 'N',
-        'Â°': '', 'Â': '', '\xe2\x80\x93': '-', '\xe2\x80\x99': "'",
+        'Ã¡': 'á', 'Ã©': 'é', 'Ã\xad': 'í', 'Ã³': 'ó', 'Ãº': 'ú',
+        'Ã\x81': 'Á', 'Ã\x89': 'É', 'Ã\x8d': 'Í', 'Ã\x93': 'Ó', 'Ã\x9a': 'Ú',
+        'Ã±': 'ñ', 'Ã\x91': 'Ñ',
+        'Â°': '°', 'Â': '',
+        'â€“': '–', 'â€”': '—',
+        'â€œ': '"', 'â€\x9d': '"',
+        'â€˜': "'", 'â€™': "'",
+        '\xc2\xb0': '°', '\xc2': '',
+        '\xe2\x80\x93': '–', '\xe2\x80\x94': '—',
+        '\xe2\x80\x9c': '"', '\xe2\x80\x9d': '"',
+        '\xe2\x80\x98': "'", '\xe2\x80\x99': "'",
     }
     for k, v in reemplazos.items():
-        texto = texto.replace(k, v)
-    return texto
+        if k in texto:
+            texto = texto.replace(k, v)
+    return texto.strip()
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 2. CARGA DE DATOS EN CACHE (DESDE data/)
@@ -460,7 +533,7 @@ def obtener_ruta_data(nombre_archivo):
     return nombre_archivo
 
 @st.cache_data(show_spinner="Cargando base de datos consolidada Masshopping...")
-def cargar_datos_base(mtime_tranz=0.0, mtime_ventas=0.0, mtime_art=0.0, mtime_cons=0.0):
+def cargar_datos_base(mtime_tranz=0.0, mtime_ventas=0.0, mtime_art=0.0, mtime_cons=0.0, mtime_img=0.0):
     # 1. Transacciones unificadas (Prioridad: data/tranzabilidad.csv como fuente única de verdad)
     ruta_tranz = obtener_ruta_data('tranzabilidad.csv')
     ruta_ventas = obtener_ruta_data('ventas.csv')
@@ -470,7 +543,10 @@ def cargar_datos_base(mtime_tranz=0.0, mtime_ventas=0.0, mtime_art=0.0, mtime_co
         try:
             df_tranz = pd.read_csv(ruta_tranz, encoding='utf-8-sig', low_memory=False)
         except Exception:
-            df_tranz = pd.read_csv(ruta_tranz, encoding='latin1', low_memory=False)
+            try:
+                df_tranz = pd.read_csv(ruta_tranz, encoding='cp1252', low_memory=False)
+            except Exception:
+                df_tranz = pd.read_csv(ruta_tranz, encoding='latin1', low_memory=False)
             
         col_art = 'Artículo' if 'Artículo' in df_tranz.columns else [c for c in df_tranz.columns if 'rt' in c.lower() and 'digo' not in c.lower()][0]
         col_tipo = [c for c in df_tranz.columns if 'Tipo' in c and 'Trans' in c][0]
@@ -518,7 +594,10 @@ def cargar_datos_base(mtime_tranz=0.0, mtime_ventas=0.0, mtime_art=0.0, mtime_co
         try:
             df_trans = pd.read_csv(ruta_ventas, encoding='utf-8-sig', low_memory=False)
         except Exception:
-            df_trans = pd.read_csv(ruta_ventas, encoding='latin1', low_memory=False)
+            try:
+                df_trans = pd.read_csv(ruta_ventas, encoding='cp1252', low_memory=False)
+            except Exception:
+                df_trans = pd.read_csv(ruta_ventas, encoding='latin1', low_memory=False)
             
         col_art = [c for c in df_trans.columns if 'digo' in c and 'rt' in c][0]
         col_fecha = [c for c in df_trans.columns if 'Fecha' in c][0]
@@ -537,7 +616,14 @@ def cargar_datos_base(mtime_tranz=0.0, mtime_ventas=0.0, mtime_art=0.0, mtime_co
         df_reposicion = pd.DataFrame(columns=['sku', 'fecha', 'cantidad'])
         # Fallback a reportes individuales si existieran
         reports = [i + 4 for i in range(12)]
-        dfs = [pd.read_csv(f"reporte ({r}).csv", encoding="latin1", low_memory=False) for r in reports if os.path.exists(f"reporte ({r}).csv")]
+        dfs = []
+        for r in reports:
+            fn = f"reporte ({r}).csv"
+            if os.path.exists(fn):
+                try:
+                    dfs.append(pd.read_csv(fn, encoding="utf-8-sig", low_memory=False))
+                except Exception:
+                    dfs.append(pd.read_csv(fn, encoding="latin1", low_memory=False))
         df_trans = pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
         if not df_trans.empty:
             col_art = [c for c in df_trans.columns if 'digo' in c and 'rt' in c][0]
@@ -603,7 +689,13 @@ def cargar_datos_base(mtime_tranz=0.0, mtime_ventas=0.0, mtime_art=0.0, mtime_co
                 
     if df_art is None or df_art.empty:
         if os.path.exists(ruta_art_csv):
-            df_art = pd.read_csv(ruta_art_csv, encoding='latin1')
+            try:
+                df_art = pd.read_csv(ruta_art_csv, encoding='utf-8-sig')
+            except Exception:
+                try:
+                    df_art = pd.read_csv(ruta_art_csv, encoding='cp1252')
+                except Exception:
+                    df_art = pd.read_csv(ruta_art_csv, encoding='latin1')
 
     col_art_art = [c for c in df_art.columns if 'digo' in c and 'rt' in c][0]
     col_exist = [c for c in df_art.columns if 'Existencia' in c or 'Disponible' in c][0]
@@ -628,17 +720,19 @@ def cargar_datos_base(mtime_tranz=0.0, mtime_ventas=0.0, mtime_art=0.0, mtime_co
     
     # 3. Metadata logistica + Stock en Transito (desde data/consolidado.csv)
     ruta_cons = obtener_ruta_data('consolidado.csv')
-    df_cons = pd.read_csv(ruta_cons, encoding='latin1')
+    try:
+        df_cons = pd.read_csv(ruta_cons, encoding='utf-8-sig')
+    except Exception:
+        try:
+            df_cons = pd.read_csv(ruta_cons, encoding='cp1252')
+        except Exception:
+            df_cons = pd.read_csv(ruta_cons, encoding='latin1')
     
-    # Extraer stock en transito
-    contenedores_transito = [
-        'CONTENEDORES JULIO',
-        'CONTENEDOR EGIPTO',
-        'CONTENEDOR  REVESTIMIENTO ',
-        'CONTENEDOR REVESTIMIENTO',
-        'CONTENEDOR SEPTIEMBRE'
-    ]
-    df_transit = df_cons[df_cons['contenedor'].astype(str).str.strip().isin([c.strip() for c in contenedores_transito]) | df_cons['contenedor'].isin(contenedores_transito)].copy()
+    # Extraer stock en transito (usa el array centralizado CONTENEDORES_TRANSITO)
+    df_transit = df_cons[
+        df_cons['contenedor'].astype(str).str.strip().isin([c.strip() for c in CONTENEDORES_TRANSITO]) |
+        df_cons['contenedor'].isin(CONTENEDORES_TRANSITO)
+    ].copy()
     df_transit['codigo'] = df_transit['codigo'].astype(str).str.strip()
     df_transit['cantidad'] = pd.to_numeric(df_transit['cantidad'].astype(str).str.replace(',', '', regex=False), errors='coerce').fillna(0)
     df_transit_exp = (
@@ -673,7 +767,14 @@ def cargar_datos_base(mtime_tranz=0.0, mtime_ventas=0.0, mtime_art=0.0, mtime_co
     if not os.path.exists(ruta_images):
         ruta_images = obtener_ruta_data('IMAGES.csv')
         
-    df_images = pd.read_csv(ruta_images, encoding='latin1')
+    try:
+        df_images = pd.read_csv(ruta_images, encoding='utf-8-sig')
+    except Exception:
+        try:
+            df_images = pd.read_csv(ruta_images, encoding='cp1252')
+        except Exception:
+            df_images = pd.read_csv(ruta_images, encoding='latin1')
+            
     df_images = df_images[['CODIGO', 'NOMBRE', 'IMAGEN']].rename(
         columns={'CODIGO': 'sku', 'NOMBRE': 'nombre', 'IMAGEN': 'imagen_url'}
     )
@@ -687,8 +788,8 @@ def cargar_datos_base(mtime_tranz=0.0, mtime_ventas=0.0, mtime_art=0.0, mtime_co
     df_info_prod = pd.merge(df_info_prod, df_nombres_trans, on='sku', how='outer')
     
     df_info_prod['nombre_final'] = df_info_prod['nombre'].fillna(df_info_prod['nombre_articulo']).fillna(df_info_prod['nombre_trans']).fillna('Sin Descripcion')
-    df_info_prod['nombre'] = df_info_prod['nombre_final'].replace('nan', 'Sin Descripcion')
-    df_info_prod['categoria'] = df_info_prod['categoria'].fillna('GENERAL')
+    df_info_prod['nombre'] = df_info_prod['nombre_final'].replace('nan', 'Sin Descripcion').astype(str).apply(limpiar_mojibake)
+    df_info_prod['categoria'] = df_info_prod['categoria'].fillna('GENERAL').astype(str).apply(limpiar_mojibake)
     df_info_prod = df_info_prod[['sku', 'nombre', 'categoria', 'imagen_url']]
     
     import json
@@ -715,12 +816,16 @@ p_tr = obtener_ruta_data('tranzabilidad.csv')
 p_v = obtener_ruta_data('ventas.csv')
 p_a = obtener_ruta_data('articulos.xlsx')
 p_c = obtener_ruta_data('consolidado.csv')
+p_img = obtener_ruta_data('images.csv')
+if not os.path.exists(p_img):
+    p_img = obtener_ruta_data('IMAGES.csv')
 mtime_tranz = os.path.getmtime(p_tr) if os.path.exists(p_tr) else 0.0
 mtime_ventas = os.path.getmtime(p_v) if os.path.exists(p_v) else 0.0
 mtime_art = os.path.getmtime(p_a) if os.path.exists(p_a) else 0.0
 mtime_cons = os.path.getmtime(p_c) if os.path.exists(p_c) else 0.0
+mtime_img = os.path.getmtime(p_img) if os.path.exists(p_img) else 0.0
 
-df_trans, df_art, df_metadata, df_info_prod, df_stock_transito, df_p2p, df_fco_ult, df_reposicion = cargar_datos_base(mtime_tranz, mtime_ventas, mtime_art, mtime_cons)
+df_trans, df_art, df_metadata, df_info_prod, df_stock_transito, df_p2p, df_fco_ult, df_reposicion = cargar_datos_base(mtime_tranz, mtime_ventas, mtime_art, mtime_cons, mtime_img)
 
 # Excluir de forma global y permanente el SKU MASS1350 de todo el sistema
 df_trans = df_trans[df_trans['sku'] != 'MASS1350']
@@ -901,20 +1006,31 @@ def ejecutar_motor(df_t, _df_a, _df_m, _df_info, _df_transit, _df_fco, lt, flete
             mu_incond = ts_win.mean()
             mu_4w = ts_win[-4:].mean() if len(ts_win) >= 4 else mu_incond
             
-            # Cálculo de tendencia porcentual (últimas 4 semanas vs 4 semanas anteriores)
+            # Cálculo de tendencia robusta y legible (últimas 4 semanas vs 4 semanas anteriores)
             if len(ts_win) >= 8:
                 prev_4w = ts_win[-8:-4].mean()
-                if prev_4w > 0:
-                    var_trend = ((mu_4w - prev_4w) / prev_4w) * 100.0
-                elif mu_4w > 0:
-                    var_trend = 100.0
+                diff_abs = mu_4w - prev_4w
+                if prev_4w == 0 and mu_4w == 0:
+                    tendencia_txt = "⏸️ Sin ventas"
+                elif prev_4w > 0 and mu_4w == 0:
+                    tendencia_txt = "🔴 -100% (Agotado/Parado)"
+                elif prev_4w == 0 and mu_4w > 0:
+                    tendencia_txt = f"🟢 Reactivado (+{mu_4w:.1f}/s)"
                 else:
-                    var_trend = 0.0
-                tendencia_txt = f"{'📈 +' if var_trend > 5 else ('📉 ' if var_trend < -5 else '➡️ ')}{var_trend:+.0f}%"
+                    pct = (diff_abs / prev_4w) * 100.0
+                    # Si el volumen base era insignificante (<1 ud/sem), evitar porcentajes inflados de +800%
+                    if prev_4w < 1.0 and pct > 100:
+                        tendencia_txt = f"📈 En alza (+{diff_abs:.1f} uds/s)"
+                    elif pct >= 15:
+                        tendencia_txt = f"📈 +{pct:.0f}%"
+                    elif pct <= -15:
+                        tendencia_txt = f"📉 {pct:.0f}%"
+                    else:
+                        tendencia_txt = "➡️ Estable"
             elif len(ts_win) >= 4:
-                tendencia_txt = "📈 Activo" if mu_4w > 0 else "➡️ Estable"
+                tendencia_txt = f"🆕 Reciente ({mu_4w:.1f} uds/s)" if mu_4w > 0 else "🆕 Reciente (Sin ventas)"
             else:
-                tendencia_txt = "➡️ Estable"
+                tendencia_txt = "🆕 Nuevo (<4 sem)"
             
             if len(ts_win) > 1:
                 alpha = 2.0 / (min(8, len(ts_win)) + 1.0)
@@ -1066,8 +1182,8 @@ def ejecutar_motor(df_t, _df_a, _df_m, _df_info, _df_transit, _df_fco, lt, flete
     df_calc['cm_p'] = pd.to_numeric(df_calc['cm_p'], errors='coerce').fillna(0.0)
     
     df_calc = pd.merge(df_calc, _df_info, on='sku', how='left')
-    df_calc['nombre'] = df_calc['nombre'].fillna('Sin Nombre')
-    df_calc['categoria'] = df_calc['categoria'].fillna('GENERAL')
+    df_calc['nombre'] = df_calc['nombre'].fillna('Sin Nombre').astype(str).apply(limpiar_mojibake)
+    df_calc['categoria'] = df_calc['categoria'].fillna('GENERAL').astype(str).apply(limpiar_mojibake)
     df_calc['imagen_url'] = df_calc['imagen_url'].fillna('')
     
     # Historial de compras FCO y estado de reposición
@@ -1092,6 +1208,8 @@ def ejecutar_motor(df_t, _df_a, _df_m, _df_info, _df_transit, _df_fco, lt, flete
         [pct_acum <= 0.50, pct_acum <= 0.80, pct_acum <= 0.95],
         ['AA', 'A', 'B'], default='C'
     )
+    df_calc['pct_ventas_total'] = (df_calc['total_ventas'] / v_tot * 100) if v_tot > 0 else 0.0
+    df_calc['pct_ventas_acum'] = (pct_acum * 100)
     
     # XYZ (Semanal)
     df_calc['clase_xyz'] = np.select(
@@ -1154,23 +1272,23 @@ def ejecutar_motor(df_t, _df_a, _df_m, _df_info, _df_transit, _df_fco, lt, flete
     
     cajas_sug = np.where(
         df_calc['requiere_pedido'],
-        np.ceil(eoq / df_calc['cantidad_por_caja']).astype(int),
+        np.maximum(1, np.ceil(eoq / df_calc['cantidad_por_caja']).astype(int)),
         0
     )
     df_calc['cajas_sugeridas'] = cajas_sug
     df_calc['pedir_cajas'] = df_calc['cajas_sugeridas']
-    df_calc['incluir_en_pedido'] = df_calc['requiere_pedido']
+    df_calc['incluir_en_pedido'] = False
     
     # Decisión de pedido MENSUAL
     d_anual_m = df_calc['demanda_mensual_prom'] * 12.0
-    eoq_m = np.where(h > 0, np.sqrt((2 * d_anual_m * c_orden) / h), 0.0)
+    eoq_m = np.where(h > 0, np.sqrt(np.maximum(0.0, (2 * d_anual_m * c_orden) / h)), 0.0)
     eoq_m = np.nan_to_num(eoq_m, nan=0.0)
     df_calc['eoq_mensual'] = eoq_m
     df_calc['requiere_pedido_mensual'] = df_calc['stock_total_disponible'] <= df_calc['rop_mensual']
     df_calc['estado_mensual'] = np.where(df_calc['requiere_pedido_mensual'], 'REORDENAR', 'OK')
     df_calc['cajas_sugeridas_mensual'] = np.where(
         df_calc['requiere_pedido_mensual'],
-        np.ceil(eoq_m / df_calc['cantidad_por_caja']).astype(int),
+        np.maximum(1, np.ceil(eoq_m / df_calc['cantidad_por_caja']).astype(int)),
         0
     )
     
@@ -1267,11 +1385,27 @@ with tab1:
         if f_categoria:
             mask = mask & (df_modelo['categoria'].isin(f_categoria))
     
-    df_vista = df_modelo[mask].copy()
+    # Excluir productos ya enviados a Google Sheets en la sesión activa
+    skus_subidos_gsheet = st.session_state.get('skus_enviados_gsheet', set())
+    if skus_subidos_gsheet:
+        mask = mask & (~df_modelo['sku'].isin(skus_subidos_gsheet))
+        
+    df_vista = df_modelo[mask].copy().reset_index(drop=True)
+    df_vista.index = np.arange(1, len(df_vista) + 1)
+    
+    if skus_subidos_gsheet:
+        col_inf, col_rst = st.columns([3.5, 1.5])
+        with col_inf:
+            st.info(f"ℹ️ **{len(skus_subidos_gsheet)} productos** ya fueron subidos a Google Sheets y se han retirado de la lista.")
+        with col_rst:
+            if st.button("🔄 Restablecer lista completa", key="btn_rst_subidos_t1"):
+                st.session_state['skus_enviados_gsheet'] = set()
+                reset_seleccion_estado()
+                st.rerun()
     
     st.caption(f"Mostrando **{len(df_vista):,}** productos de {len(df_modelo):,} totales.")
     
-    seleccionar_todos = st.checkbox("Marcar todos los productos mostrados para incluirlos en el pedido")
+    seleccionar_todos = st.checkbox("Marcar todos los productos mostrados para incluirlos en el pedido", key="chk_seleccionar_todos_t1")
     if seleccionar_todos:
         df_vista['incluir_en_pedido'] = True
     else:
@@ -1284,6 +1418,7 @@ with tab1:
         'cantidad_por_caja', 'CBMM', 'costo', 'costo_puesto'
     ]
     
+    v_editor_t1 = st.session_state.get('v_editor_t1', 0)
     df_editado = st.data_editor(
         df_vista[cols_editor],
         column_config={
@@ -1308,11 +1443,12 @@ with tab1:
         disabled=['imagen_url', 'sku', 'nombre', 'categoria', 'clase_abc_xyz', 'estado_fco', 'stock_actual', 'stock_transito', 'rop', 'rop_mensual', 'demanda_semanal_prom', 'demanda_mensual_prom', 'cantidad_por_caja', 'CBMM', 'costo', 'costo_puesto'],
         use_container_width=True,
         height=420,
-        key="editor_masshopping_cont"
+        key=f"editor_masshopping_cont_{v_editor_t1}"
     )
     
-    # Calculos en tiempo real
-    seleccionados = df_editado[df_editado['incluir_en_pedido'] & (df_editado['pedir_cajas'] > 0)].copy()
+    # Calculos en tiempo real para seleccionados (mínimo 1 caja si está marcado)
+    seleccionados = df_editado[df_editado['incluir_en_pedido']].copy()
+    seleccionados['pedir_cajas'] = np.maximum(1, pd.to_numeric(seleccionados['pedir_cajas'], errors='coerce').fillna(1).astype(int))
     seleccionados['cbm_total'] = seleccionados['pedir_cajas'] * seleccionados['CBMM']
     seleccionados['unidades_total'] = seleccionados['pedir_cajas'] * seleccionados['cantidad_por_caja']
     seleccionados['inversion_fob'] = seleccionados['unidades_total'] * seleccionados['costo']
@@ -1467,7 +1603,21 @@ with tab3:
             
             with col_info:
                 st.markdown(f"<h3 style='margin:0; color:#141E32;'>{item['nombre']}</h3>", unsafe_allow_html=True)
-                st.markdown(f"<p style='color:#5AA06E; font-weight:700; margin-top:4px;'>Codigo SKU: <span style='color:#141E32;'>{item['sku']}</span> | Categoria: <span style='color:#141E32;'>{item['categoria']}</span> | Segmento: <span style='color:#141E32;'>{item['clase_abc_xyz']}</span></p>", unsafe_allow_html=True)
+                pct_v = float(item.get('pct_ventas_total', 0.0))
+                pct_a = float(item.get('pct_ventas_acum', 0.0))
+                cv_w = float(item.get('cv', 0.0))
+                cv_m = float(item.get('cv_mensual', 0.0))
+                st.markdown(f"""
+                <p style='color:#5AA06E; font-weight:700; margin-top:4px; margin-bottom:2px;'>
+                    Codigo SKU: <span style='color:#141E32;'>{item['sku']}</span> | 
+                    Categoria: <span style='color:#141E32;'>{item['categoria']}</span> | 
+                    Segmento: <span style='color:#141E32;'>{item['clase_abc_xyz']}</span>
+                </p>
+                <p style='font-size:12.5px; color:#2E5B3D; margin-top:2px; margin-bottom:12px; background:#F0F8F3; padding:6px 12px; border-radius:6px; border:1px solid #D5E7DB;'>
+                    <b>📊 Justificación ABC:</b> Aporta el <b>{pct_v:.2f}%</b> de ventas totales (Pareto Acumulado: <b>{pct_a:.1f}%</b> → Clase <b>{item['clase_abc']}</b>) &nbsp;&bull;&nbsp; 
+                    <b>📈 Justificación XYZ:</b> CV Semanal: <b>{cv_w:.2f}</b> (Clase <b>{item['clase_xyz']}</b>) | CV Mensual: <b>{cv_m:.2f}</b> (Clase <b>{item['clase_xyz_mensual']}</b>)
+                </p>
+                """, unsafe_allow_html=True)
                 
                 estado_html = f'<span class="badge-status-reorden">REORDENAR</span>' if item['estado'] == 'REORDENAR' else f'<span class="badge-status-ok">OK</span>'
                 estado_m_html = f'<span class="badge-status-reorden">REORDENAR</span>' if item['estado_mensual'] == 'REORDENAR' else f'<span class="badge-status-ok">OK</span>'
@@ -1806,6 +1956,16 @@ with tab3:
                 m_row = df_modelo[df_modelo['sku'] == sku_code]
                 if not m_row.empty:
                     mr = m_row.iloc[0]
+                    nom_prod = mr['nombre']
+                    if len(nom_prod) > 35:
+                        nom_prod = nom_prod[:35] + '...'
+                    clase_abc_val = mr['clase_abc']
+                    pct_v_tot = f"{mr.get('pct_ventas_total', 0.0):.2f}%"
+                    pct_v_acum = f"{mr.get('pct_ventas_acum', 0.0):.1f}%"
+                    
+                    # Semanal
+                    clase_xyz_w = mr['clase_xyz']
+                    cv_w_val = f"{mr['cv']:.2f}" if not np.isnan(mr['cv']) else 'N/A'
                     cuad_w_str = str(mr['cuadrante']).upper()
                     adi_w_val = f"{mr['adi']:.2f}"
                     cv2_w_val = f"{(mr['cv']**2):.2f}" if not np.isnan(mr['cv']) else 'N/A'
@@ -1815,6 +1975,9 @@ with tab3:
                     cajas_w_val = f"{mr['cajas_sugeridas']:,.0f}"
                     est_w_val = mr['estado']
                     
+                    # Mensual
+                    clase_xyz_m = mr['clase_xyz_mensual']
+                    cv_m_val = f"{mr['cv_mensual']:.2f}" if not np.isnan(mr['cv_mensual']) else 'N/A'
                     cuad_m_str = str(mr['cuadrante_mensual']).upper()
                     adi_m_val = f"{mr['adi_mensual']:.2f}"
                     cv2_m_val = f"{(mr['cv_mensual']**2):.2f}" if not np.isnan(mr['cv_mensual']) else 'N/A'
@@ -1824,11 +1987,18 @@ with tab3:
                     cajas_m_val = f"{mr['cajas_sugeridas_mensual']:,.0f}"
                     est_m_val = mr['estado_mensual']
                 else:
-                    cuad_w_str, adi_w_val, cv2_w_val, dem_w_val, ss_w_val, rop_w_val, cajas_w_val, est_w_val = ('-', '-', '-', '-', '-', '-', '-', '-')
-                    cuad_m_str, adi_m_val, cv2_m_val, dem_m_val, ss_m_val, rop_m_val, cajas_m_val, est_m_val = ('-', '-', '-', '-', '-', '-', '-', '-')
+                    nom_prod, clase_abc_val, pct_v_tot, pct_v_acum = ('-', '-', '-', '-')
+                    clase_xyz_w, cv_w_val, cuad_w_str, adi_w_val, cv2_w_val, dem_w_val, ss_w_val, rop_w_val, cajas_w_val, est_w_val = ('-', '-', '-', '-', '-', '-', '-', '-', '-', '-')
+                    clase_xyz_m, cv_m_val, cuad_m_str, adi_m_val, cv2_m_val, dem_m_val, ss_m_val, rop_m_val, cajas_m_val, est_m_val = ('-', '-', '-', '-', '-', '-', '-', '-', '-', '-')
                 
                 resultados_mensuales.append({
                     'SKU': sku_code,
+                    'Producto': nom_prod,
+                    'Clase ABC': clase_abc_val,
+                    '% Ventas Totales': pct_v_tot,
+                    'Pareto Acumulado': pct_v_acum,
+                    'Clase XYZ (Sem)': clase_xyz_w,
+                    'CV (Sem)': cv_w_val,
                     'Cuadrante (SEM)': cuad_w_str,
                     'ADI (Sem)': adi_w_val,
                     'CV² (Sem)': cv2_w_val,
@@ -1838,6 +2008,8 @@ with tab3:
                     'Cajas (Sem)': cajas_w_val,
                     'Estado (Sem)': est_w_val,
                     '|': '║',
+                    'Clase XYZ (Mes)': clase_xyz_m,
+                    'CV (Mes)': cv_m_val,
                     'Cuadrante (MES)': cuad_m_str,
                     'ADI (Mes)': adi_m_val,
                     'CV² (Mes)': cv2_m_val,
@@ -1902,7 +2074,13 @@ with tab3:
             
             # Tabla comparativa
             st.markdown("#### Comparativa Integral de Estadísticas y Parámetros: Semanal (LT=15 sem) vs Mensual (LT=3.5 meses)")
-            st.dataframe(pd.DataFrame(resultados_mensuales), use_container_width=True)
+            st.caption("📌 **Criterios de Clasificación:**<br>"
+                       "• **% Ventas Totales y Pareto Acumulado (Por qué es ABC):** AA (acumula hasta el 50% de ingresos), A (50% a 80%), B (80% a 95%), C (último 5%).<br>"
+                       "• **CV y Clase XYZ (Por qué es X, Y o Z):** X (CV ≤ 0.50, demanda estable y predecible), Y (0.50 < CV ≤ 1.00, variabilidad intermedia), Z (CV > 1.00, demanda errática o muy dispersa).",
+                       unsafe_allow_html=True)
+            df_res_m = pd.DataFrame(resultados_mensuales)
+            df_res_m.index = np.arange(1, len(df_res_m) + 1)
+            st.dataframe(df_res_m, use_container_width=True)
 
 
 
@@ -1918,10 +2096,31 @@ with tab5:
     df_abc['pct_acum'] = (df_abc['total_ventas'].cumsum() / df_abc['total_ventas'].sum()) * 100
     df_abc['sku_num'] = np.arange(1, len(df_abc) + 1)
     
+    # Selector interactivo de alcance
+    r_pareto = st.radio(
+        "Alcance del Gráfico de Pareto:",
+        ["📊 Catálogo Completo (Muestra toda la curva 0%-100% con Clases AA, A, B y C)", "Top 100 SKUs", "Top 300 SKUs", "Top 500 SKUs"],
+        index=0,
+        horizontal=True,
+        key="radio_pareto_scope"
+    )
+    
+    if "Top 100" in r_pareto:
+        df_abc_chart = df_abc.head(100)
+        titulo_pareto = "Pareto ABC por Ingresos (Top 100 SKUs)"
+    elif "Top 300" in r_pareto:
+        df_abc_chart = df_abc.head(300)
+        titulo_pareto = "Pareto ABC por Ingresos (Top 300 SKUs)"
+    elif "Top 500" in r_pareto:
+        df_abc_chart = df_abc.head(500)
+        titulo_pareto = "Pareto ABC por Ingresos (Top 500 SKUs)"
+    else:
+        df_abc_chart = df_abc
+        titulo_pareto = f"Pareto ABC por Ingresos - Curva Completa ({len(df_abc):,} SKUs)"
+        
     color_map = {'AA': '#141E32', 'A': '#5AA06E', 'B': '#FDD835', 'C': '#E65100'}
     
     fig_abc = make_subplots(specs=[[{"secondary_y": True}]])
-    df_abc_chart = df_abc.head(100)
     
     for clase in ['AA', 'A', 'B', 'C']:
         mask_clase = df_abc_chart['clase_abc'] == clase
@@ -1945,8 +2144,8 @@ with tab5:
     
     fig_abc.update_layout(
         height=500,
-        title="Pareto ABC por Ingresos (Top 100 SKUs)",
-        xaxis=dict(showticklabels=False, title="Productos ordenados por Ventas (Top 100)", showgrid=False),
+        title=titulo_pareto,
+        xaxis=dict(showticklabels=False, title=f"Productos ordenados por Ventas ({len(df_abc_chart):,} mostrados)", showgrid=False),
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
         plot_bgcolor="#FFFFFF",
         paper_bgcolor="#FFFFFF",
@@ -2222,15 +2421,48 @@ with tab7:
         if f_cat_opt:
             mask_opt = mask_opt & (df_modelo['categoria'].isin(f_cat_opt))
             
-    df_optimo_filtrado = df_modelo[mask_opt]
-    
-    # Ordenar únicamente el subconjunto filtrado para no sobrecargar la CPU
-    if not busqueda_skus_opt and len(df_optimo_filtrado) > 100:
-        df_optimo_vista = df_optimo_filtrado.sort_values(by=['stock_actual', rop_eval_col], ascending=[True, False]).head(100).copy()
-    else:
-        df_optimo_vista = df_optimo_filtrado.sort_values(by=['stock_actual', rop_eval_col], ascending=[True, False]).copy()
+    # Excluir productos ya enviados a Google Sheets en la sesión activa
+    skus_subidos_gsheet_opt = st.session_state.get('skus_enviados_gsheet', set())
+    if skus_subidos_gsheet_opt:
+        mask_opt = mask_opt & (~df_modelo['sku'].isin(skus_subidos_gsheet_opt))
         
-    df_optimo_vista['pedir_cajas'] = df_optimo_vista[cajas_eval_col]
+    df_optimo_filtrado = df_modelo[mask_opt].copy()
+    
+    # Mapeo de prioridad estratégica de reposición ABC-XYZ (1 = Máxima Prioridad: AA-X)
+    prioridad_abc_xyz = {
+        'AA-X': 1, 'AA-Y': 2, 'AA-Z': 3,
+        'A-X': 4,  'A-Y': 5,  'A-Z': 6,
+        'B-X': 7,  'B-Y': 8,  'B-Z': 9,
+        'C-X': 10, 'C-Y': 11, 'C-Z': 12
+    }
+    col_segmento_opt = 'clase_abc_xyz_mensual' if usar_mensual_opt else 'clase_abc_xyz'
+    df_optimo_filtrado['prioridad_ranking'] = df_optimo_filtrado[col_segmento_opt].map(prioridad_abc_xyz).fillna(99)
+    
+    # Ordenamiento jerárquico: 1º Segmento ABC-XYZ, 2º Menor Stock (0, 1, 2...), 3º Mayor ROP
+    df_optimo_ordenado = df_optimo_filtrado.sort_values(
+        by=['prioridad_ranking', 'stock_actual', rop_eval_col],
+        ascending=[True, True, False]
+    )
+    
+    if not busqueda_skus_opt and len(df_optimo_ordenado) > 100:
+        df_optimo_vista = df_optimo_ordenado.head(100).copy()
+    else:
+        df_optimo_vista = df_optimo_ordenado.copy()
+        
+    df_optimo_vista = df_optimo_vista.reset_index(drop=True)
+    df_optimo_vista.index = np.arange(1, len(df_optimo_vista) + 1)
+        
+    df_optimo_vista['pedir_cajas'] = np.maximum(1, pd.to_numeric(df_optimo_vista[cajas_eval_col], errors='coerce').fillna(1).astype(int))
+    
+    if skus_subidos_gsheet_opt:
+        col_inf_opt, col_rst_opt = st.columns([3.5, 1.5])
+        with col_inf_opt:
+            st.info(f"ℹ️ **{len(skus_subidos_gsheet_opt)} productos** ya fueron subidos a Google Sheets y se han retirado de la lista.")
+        with col_rst_opt:
+            if st.button("🔄 Restablecer lista completa", key="btn_rst_subidos_t7"):
+                st.session_state['skus_enviados_gsheet'] = set()
+                reset_seleccion_estado()
+                st.rerun()
     
     if df_optimo_vista.empty:
         st.success("No hay productos que cumplan los criterios seleccionados en este momento.")
@@ -2262,6 +2494,7 @@ with tab7:
         rop_label_sem = f"ROP Sem ({lead_time}s)"
         rop_label_mes = "ROP Mes (3.5m)"
         
+        v_editor_t7 = st.session_state.get('v_editor_t7', 0)
         df_optimo_editado = st.data_editor(
             df_optimo_vista[cols_editor_opt],
             column_config={
@@ -2294,11 +2527,13 @@ with tab7:
             ],
             use_container_width=True,
             height=420,
-            key="editor_pedido_optimo_tab7"
+            key=f"editor_pedido_optimo_tab7_{v_editor_t7}"
         )
         
         # ── 5. CÁLCULO DE CONTENEDOR EN TIEMPO REAL PARA SELECCIONADOS ──
-        seleccionados_opt = df_optimo_editado[df_optimo_editado['incluir_en_pedido'] & (df_optimo_editado['pedir_cajas'] > 0)].copy()
+        # Si el usuario lo marcó con el checkbox, incluirlo SIEMPRE (con al menos 1 caja si estaba en 0)
+        seleccionados_opt = df_optimo_editado[df_optimo_editado['incluir_en_pedido']].copy()
+        seleccionados_opt['pedir_cajas'] = np.maximum(1, pd.to_numeric(seleccionados_opt['pedir_cajas'], errors='coerce').fillna(1).astype(int))
         seleccionados_opt['cbm_total'] = seleccionados_opt['pedir_cajas'] * seleccionados_opt['CBMM']
         seleccionados_opt['unidades_total'] = seleccionados_opt['pedir_cajas'] * seleccionados_opt['cantidad_por_caja']
         seleccionados_opt['inversion_fob'] = seleccionados_opt['unidades_total'] * seleccionados_opt['costo']
