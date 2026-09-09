@@ -31,32 +31,32 @@ El sistema opera bajo el principio de **Fuente Única de Verdad Histórica**, in
 
 ```
 data/
-├── tranzabilidad.csv   # Historial completo de movimientos de inventario (184k+ registros)
+├── ventas.csv          # Historial de ventas, ingresos reales y facturación FVE (Fuente Única de Demanda y ABC)
+├── tranzabilidad.csv   # Movimientos de inventario ERP (Utilizado estrictamente para Compras FCO y Devoluciones DEC)
 ├── articulos.xlsx      # Catálogo maestro y existencias actuales en almacén
 ├── consolidado.csv     # Metadata logística (CBM, dimensiones, empaque, costos FOB, tránsito)
 ├── images.csv          # Catálogo de enlaces CDN de fotografías de producto
 └── p2p.json            # Serie temporal cambiaria USDT/VES (Binance P2P)
 ```
 
-### 2.1. Reglas de Negocio para Transacciones (`tranzabilidad.csv`)
+### 2.1. Reglas de Negocio para Transacciones y Análisis ABC
 
-Cada movimiento en el ERP posee un código de transacción. El sistema aplica un filtrado riguroso para aislar la demanda comercial y la reposición efectiva:
+1. **Ventas y Análisis ABC (`ventas.csv` + `ventas_i.csv`):**
+   - El análisis de demanda comercial, series temporales, ADI, CV y la clasificación **Pareto ABC** se alimenta **exclusivamente de `ventas.csv`** (y cualquier partición incremental `ventas_1.csv`, `ventas_2.csv`, etc.).
+   - Utiliza montos de facturación reales en dólares (`Total`, `Total Costo`, `Costo Unitario`) evitando cualquier distorsión en la valoración monetaria del inventario y las ventas.
+   - **JAMÁS se utiliza `tranzabilidad.csv` para ventas ni para el cálculo ABC.**
+
+2. **Historial de Compras y Reposición (`tranzabilidad.csv`):**
+   - Si está presente, `tranzabilidad.csv` se utiliza de forma estricta y delimitada para extraer las compras a proveedores (`FCO`) y devoluciones (`DEC`), permitiendo calcular la fecha de última compra (`ultima_fecha_fco`) y la reposición neta histórica:
 
 | Código | Tipo de Transacción | Rol en el Sistema | Tratamiento Matemático |
 | :--- | :--- | :--- | :--- |
-| **`FVE`** | Factura de Venta | Demanda Comercial (+) | Suma a la demanda real de clientes. |
-| **`NCV`** | Nota de Crédito | Corrección de Venta (−) | Resta a la demanda real (ventas netas). |
-| **`FCO`** | Factura de Compra | Entrada de Reposición (+) | Suma al histórico de compras efectivas. |
-| **`DEC`** | Devolución de Compra | Corrección de Compra (−) | Resta a compras netas recibidas. |
-| **`AJE`** | Ajuste de Entrada | Ajuste Interno Almacén | **Excluido** (no es demanda ni compra comercial). |
-| **`AJS`** | Ajuste de Salida | Merma / Ajuste Interno | **Excluido** (no es venta comercial). |
-| **`TRE`** | Traslado Entrada | Movimiento entre Bodegas | **Excluido** (no altera inventario consolidado). |
-| **`TRS`** | Traslado Salida | Movimiento entre Bodegas | **Excluido** (no altera inventario consolidado). |
-| **`REQ`** | Requisición Inventarios | Consumo Interno Oficina | **Excluido** (no es venta a clientes). |
-| **`NDV`** | Nota de Débito | Ajuste Administrativo | **Excluido** (no es compra ni venta neta). |
+| **`FVE`** | Factura de Venta (`ventas.csv`) | Demanda Comercial (+) | Suma a la demanda real de clientes y facturación real ($). |
+| **`FCO`** | Factura de Compra (`tranzabilidad.csv`) | Entrada de Reposición (+) | Suma al histórico de compras efectivas y última fecha FCO. |
+| **`DEC`** | Devolución de Compra (`tranzabilidad.csv`) | Corrección de Compra (−) | Resta a compras netas recibidas. |
 
-$$\text{Demanda Real Neta (Ventas)} = \sum \text{FVE} - \sum \text{NCV}$$
-$$\text{Reposición Neta (Compras)} = \sum \text{FCO} - \sum \text{DEC}$$
+$$\text{Demanda Real y Facturación} = \sum \text{FVE de ventas.csv}$$
+$$\text{Reposición Neta (Compras)} = \sum \text{FCO} - \sum \text{DEC de tranzabilidad.csv}$$
 
 ### 2.2. Robustez en el Procesamiento Numérico y Fechas
 1. **Limpieza de Separadores de Miles:** El ERP exporta cantidades superiores a mil con formato texto (`"3,000.00"`). El sistema aplica `.astype(str).str.replace(',', '')` previo a la conversión a punto flotante para garantizar que pedidos mayores no se conviertan en cero.

@@ -155,6 +155,16 @@ st.markdown("""
         display: inline-block;
     }
     
+    .badge-status-ignorado {
+        background-color: #546E7A;
+        color: white;
+        padding: 3px 8px;
+        border-radius: 12px;
+        font-size: 11px;
+        font-weight: 800;
+        display: inline-block;
+    }
+    
     /* Chips de Multiselect Compactos */
     .stMultiSelect [data-baseweb="tag"] {
         background-color: #EAF3ED !important;
@@ -392,27 +402,6 @@ def reset_seleccion_estado():
 def modal_asignar_contenedor_gsheet(df_sel, flete_cbm_val=500.0, df_catalogo=None):
     df_intermedio = construir_df_intermedio_gsheet(df_sel, flete_cbm_val, df_catalogo)
     
-    st.markdown(f"Estás a punto de exportar **{len(df_intermedio)} productos seleccionados** estructurados con el **Schema oficial de Google Sheets (31 Columnas)**.")
-    
-    cajas_tot = int(pd.to_numeric(df_intermedio['CANTIDAD DE CAJAS'], errors='coerce').fillna(0).sum())
-    cbm_tot = float(pd.to_numeric(df_intermedio['TOTAL CBM'], errors='coerce').fillna(0.0).sum())
-    
-    # Calcular costo FOB y DDP total numéricos
-    fob_calc = pd.to_numeric(df_intermedio['CANTIDAD'], errors='coerce').fillna(0) * pd.to_numeric(df_intermedio['COSTO'], errors='coerce').fillna(0.0)
-    fob_tot = float(fob_calc.sum())
-    ddp_tot = float(pd.to_numeric(df_intermedio['COSTO TOTAL'], errors='coerce').fillna(0.0).sum())
-    
-    col_k1, col_k2, col_k3, col_k4 = st.columns(4)
-    with col_k1:
-        st.metric("Total Cajas", f"{cajas_tot:,}")
-    with col_k2:
-        st.metric("Volumen CBM", f"{cbm_tot:,.2f} m³")
-    with col_k3:
-        st.metric("Inversión FOB", f"${fob_tot:,.2f}")
-    with col_k4:
-        st.metric("Costo Total DDP", f"${ddp_tot:,.2f}")
-    
-    st.markdown("---")
     lista_transito = obtener_opciones_contenedores_transito()
 
     contenedor_nombre = st.selectbox(
@@ -502,7 +491,6 @@ def limpiar_mojibake(texto):
                     break
         else:
             break
-            
     # Mapeo específico de remanentes o combinaciones conocidas para mantener tildes y símbolos correctos
     reemplazos = {
         'Ã¡': 'á', 'Ã©': 'é', 'Ã\xad': 'í', 'Ã³': 'ó', 'Ãº': 'ú',
@@ -522,9 +510,6 @@ def limpiar_mojibake(texto):
             texto = texto.replace(k, v)
     return texto.strip()
 
-# ══════════════════════════════════════════════════════════════════════════════
-# 2. CARGA DE DATOS EN CACHE (DESDE data/)
-# ══════════════════════════════════════════════════════════════════════════════
 def obtener_ruta_data(nombre_archivo):
     """Busca el archivo en data/ primero, y luego en la raíz como fallback."""
     ruta_data = os.path.join('data', nombre_archivo)
@@ -532,89 +517,112 @@ def obtener_ruta_data(nombre_archivo):
         return ruta_data
     return nombre_archivo
 
+def obtener_rutas_ventas():
+    """Encuentra ventas.csv y cualquier ventas_i.csv ordenados numéricamente."""
+    import re, glob
+    rutas_dict = {}
+    patrones = [
+        os.path.join('data', 'ventas*.csv'),
+        'ventas*.csv'
+    ]
+    for pat in patrones:
+        for f in glob.glob(pat):
+            base = os.path.basename(f)
+            m = re.search(r'^ventas(?:_(\d+))?\.csv$', base, re.IGNORECASE)
+            if m:
+                idx = int(m.group(1)) if m.group(1) else 0
+                if idx not in rutas_dict:
+                    rutas_dict[idx] = f
+    return [rutas_dict[k] for k in sorted(rutas_dict.keys())]
+
+def obtener_rutas_tranzabilidad():
+    """Encuentra tranzabilidad.csv y cualquier tranzabilidad_i.csv ordenados numéricamente."""
+    import re, glob
+    rutas_dict = {}
+    patrones = [
+        os.path.join('data', 'tranzabilidad*.csv'),
+        'tranzabilidad*.csv'
+    ]
+    for pat in patrones:
+        for f in glob.glob(pat):
+            base = os.path.basename(f)
+            m = re.search(r'^tranzabilidad(?:_(\d+))?\.csv$', base, re.IGNORECASE)
+            if m:
+                idx = int(m.group(1)) if m.group(1) else 0
+                if idx not in rutas_dict:
+                    rutas_dict[idx] = f
+    return [rutas_dict[k] for k in sorted(rutas_dict.keys())]
+
 @st.cache_data(show_spinner="Cargando base de datos consolidada Masshopping...")
-def cargar_datos_base(mtime_tranz=0.0, mtime_ventas=0.0, mtime_art=0.0, mtime_cons=0.0, mtime_img=0.0):
-    # 1. Transacciones unificadas (Prioridad: data/tranzabilidad.csv como fuente única de verdad)
-    ruta_tranz = obtener_ruta_data('tranzabilidad.csv')
-    ruta_ventas = obtener_ruta_data('ventas.csv')
-    df_fco_ult = pd.DataFrame(columns=['sku', 'ultima_fecha_fco'])
+def cargar_datos_base(mtime_ventas=None, mtime_tranz=None, mtime_art=0.0, mtime_cons=0.0, mtime_img=0.0):
+    # 1. Ventas / Demanda Real / Análisis ABC (Fuente EXCLUSIVA: ventas.csv y ventas_i.csv)
+    # NUNCA usar tranzabilidad.csv para ventas ni para análisis ABC
+    rutas_ventas = obtener_rutas_ventas()
+    df_clean = pd.DataFrame(columns=['sku', 'fecha', 'nombre_trans', 'cantidad', 'total_venta', 'total_costo', 'costo_unit_trans'])
     
-    if os.path.exists(ruta_tranz):
-        try:
-            df_tranz = pd.read_csv(ruta_tranz, encoding='utf-8-sig', low_memory=False)
-        except Exception:
-            try:
-                df_tranz = pd.read_csv(ruta_tranz, encoding='cp1252', low_memory=False)
-            except Exception:
-                df_tranz = pd.read_csv(ruta_tranz, encoding='latin1', low_memory=False)
+    if rutas_ventas:
+        dfs_ventas = []
+        for r_v in rutas_ventas:
+            df_temp = None
+            for enc in ['utf-8-sig', 'cp1252', 'latin1']:
+                try:
+                    df_temp = pd.read_csv(r_v, encoding=enc, low_memory=False)
+                    break
+                except Exception:
+                    continue
+            if df_temp is not None and not df_temp.empty:
+                df_temp.columns = [c.strip() for c in df_temp.columns]
+                dfs_ventas.append(df_temp)
+                
+        df_trans = pd.concat(dfs_ventas, ignore_index=True) if dfs_ventas else pd.DataFrame()
+        if not df_trans.empty:
+            for col in df_trans.select_dtypes(include=['object']).columns:
+                df_trans[col] = df_trans[col].astype(str).str.strip()
+            df_trans = df_trans.drop_duplicates()
             
-        col_art = 'Artículo' if 'Artículo' in df_tranz.columns else [c for c in df_tranz.columns if 'rt' in c.lower() and 'digo' not in c.lower()][0]
-        col_tipo = [c for c in df_tranz.columns if 'Tipo' in c and 'Trans' in c][0]
-        col_fecha = [c for c in df_tranz.columns if 'Fecha' in c and 'Trans' in c][0]
-        col_cant = [c for c in df_tranz.columns if 'Cantidad' in c][0]
-        
-        df_tranz['sku'] = df_tranz[col_art].astype(str).apply(lambda x: x.split('-')[0].strip())
-        df_tranz['nombre_trans'] = df_tranz[col_art].astype(str).apply(lambda x: x.split('-', 1)[1].strip() if '-' in x else x)
-        df_tranz['fecha'] = pd.to_datetime(df_tranz[col_fecha], format='mixed', dayfirst=True)
-        df_tranz['cantidad'] = pd.to_numeric(df_tranz[col_cant].astype(str).str.replace(',', '', regex=False), errors='coerce').fillna(0.0)
-        
-        tipo_str = df_tranz[col_tipo].astype(str)
-        is_fve = tipo_str.str.startswith('FVE')
-        is_ncv = tipo_str.str.startswith('NCV')
-        is_fco = tipo_str.str.startswith('FCO')
-        
-        # Demanda Real: Ventas netas = FVE (+) menos NCV (-)
-        # Excluye explícitamente ajustes y traslados internos: AJE, AJS, TRE, TRS, REQ, NDV
-        df_ventas = df_tranz[is_fve | is_ncv].copy()
-        df_ventas['cantidad'] = np.where(df_ventas[col_tipo].astype(str).str.startswith('FVE'), df_ventas['cantidad'], -df_ventas['cantidad'])
-        
-        df_clean = df_ventas[['sku', 'fecha', 'nombre_trans', 'cantidad']].copy()
-        df_clean['total_venta'] = df_clean['cantidad'] * 1.0
-        df_clean['total_costo'] = df_clean['cantidad'] * 1.0
-        df_clean['costo_unit_trans'] = 1.0
-        df_clean['sku'] = df_clean['sku'].astype(str).str.strip()
-        df_clean = df_clean[df_clean['sku'] != 'MASS1575']
-        
-        # Historial de compras FCO para trazabilidad de reposición
-        df_fco = df_tranz[is_fco].copy()
-        df_fco_ult = df_fco.groupby('sku')['fecha'].max().reset_index()
-        df_fco_ult.columns = ['sku', 'ultima_fecha_fco']
-        df_fco_ult['sku'] = df_fco_ult['sku'].astype(str).str.strip()
-        df_fco_ult = df_fco_ult[df_fco_ult['sku'] != 'MASS1575']
-        
-        # Reposición Neta Histórica = FCO (+) menos DEC (-)
-        is_dec = tipo_str.str.startswith('DEC')
-        df_repo = df_tranz[is_fco | is_dec].copy()
-        df_repo['cantidad'] = np.where(df_repo[col_tipo].astype(str).str.startswith('FCO'), df_repo['cantidad'], -df_repo['cantidad'])
-        df_reposicion = df_repo[['sku', 'fecha', 'cantidad']].copy()
-        df_reposicion['sku'] = df_reposicion['sku'].astype(str).str.strip()
-        df_reposicion = df_reposicion[df_reposicion['sku'] != 'MASS1575']
-    elif os.path.exists(ruta_ventas):
-        df_reposicion = pd.DataFrame(columns=['sku', 'fecha', 'cantidad'])
-        try:
-            df_trans = pd.read_csv(ruta_ventas, encoding='utf-8-sig', low_memory=False)
-        except Exception:
-            try:
-                df_trans = pd.read_csv(ruta_ventas, encoding='cp1252', low_memory=False)
-            except Exception:
-                df_trans = pd.read_csv(ruta_ventas, encoding='latin1', low_memory=False)
+            # Identificación flexible de columnas
+            col_art = next(
+                (c for c in df_trans.columns if ('digo' in c.lower() or 'art' in c.lower() or 'sku' in c.lower()) and 'padre' not in c.lower() and 'cat' not in c.lower() and 'nom' not in c.lower() and 'cliente' not in c.lower() and 'centro' not in c.lower() and 'peso' not in c.lower() and 'unidad' not in c.lower()),
+                df_trans.columns[15] if len(df_trans.columns) > 15 else None
+            )
+            col_nom_trans = next(
+                (c for c in df_trans.columns if 'nom' in c.lower() and 'art' in c.lower() and 'cliente' not in c.lower() and 'centro' not in c.lower()),
+                df_trans.columns[16] if len(df_trans.columns) > 16 else None
+            )
+            col_fecha = next((c for c in df_trans.columns if 'fecha' in c.lower()), None)
+            col_tipo = next((c for c in df_trans.columns if 'tipo' in c.lower() and 'trans' in c.lower()), None)
+            col_cant = next((c for c in df_trans.columns if c.strip().lower() == 'cantidad'), None)
+            col_tot = next((c for c in df_trans.columns if c.strip().lower() == 'total'), None)
+            col_tot_costo = next((c for c in df_trans.columns if 'total' in c.lower() and 'costo' in c.lower()), None)
+            col_cost_unit = next((c for c in df_trans.columns if 'costo' in c.lower() and 'unit' in c.lower()), None)
             
-        col_art = [c for c in df_trans.columns if 'digo' in c and 'rt' in c][0]
-        col_fecha = [c for c in df_trans.columns if 'Fecha' in c][0]
-        col_nom_trans = [c for c in df_trans.columns if 'ombre' in c and 'rt' in c][0]
-        
-        df_clean = df_trans[[col_art, col_fecha, col_nom_trans, 'Cantidad', 'Total', 'Total Costo', 'Costo Unitario']].copy()
-        df_clean.columns = ['sku', 'fecha', 'nombre_trans', 'cantidad', 'total_venta', 'total_costo', 'costo_unit_trans']
-        df_clean['sku'] = df_clean['sku'].astype(str).str.strip()
-        df_clean['cantidad'] = pd.to_numeric(df_clean['cantidad'], errors='coerce').fillna(0.0)
-        df_clean['total_venta'] = pd.to_numeric(df_clean['total_venta'].astype(str).str.replace(',', ''), errors='coerce').fillna(0.0)
-        df_clean['total_costo'] = pd.to_numeric(df_clean['total_costo'].astype(str).str.replace(',', ''), errors='coerce').fillna(0.0)
-        df_clean['costo_unit_trans'] = pd.to_numeric(df_clean['costo_unit_trans'].astype(str).str.replace(',', ''), errors='coerce').fillna(0.0)
-        df_clean['fecha'] = pd.to_datetime(df_clean['fecha'], format='mixed', dayfirst=True)
-        df_clean = df_clean[df_clean['sku'] != 'MASS1575']
+            # Demanda Real: Exclusivamente Facturas de Venta (FVE) como ventas efectivas
+            if col_tipo:
+                tipo_str = df_trans[col_tipo].astype(str)
+                df_trans = df_trans[tipo_str.str.startswith('FVE')].copy()
+                
+            cols_selected = [
+                col_art or df_trans.columns[15],
+                col_fecha or df_trans.columns[21],
+                col_nom_trans or df_trans.columns[16],
+                col_cant or 'Cantidad',
+                col_tot or 'Total',
+                col_tot_costo or 'Total Costo',
+                col_cost_unit or 'Costo Unitario'
+            ]
+            
+            df_clean = df_trans[cols_selected].copy()
+            df_clean.columns = ['sku', 'fecha', 'nombre_trans', 'cantidad', 'total_venta', 'total_costo', 'costo_unit_trans']
+            df_clean['sku'] = df_clean['sku'].astype(str).str.strip()
+            df_clean['cantidad'] = pd.to_numeric(df_clean['cantidad'].astype(str).str.replace(',', '', regex=False), errors='coerce').fillna(0.0)
+            df_clean = df_clean[df_clean['cantidad'] > 0]  # Ventas efectivas únicamente
+            df_clean['total_venta'] = pd.to_numeric(df_clean['total_venta'].astype(str).str.replace(',', '', regex=False), errors='coerce').fillna(0.0)
+            df_clean['total_costo'] = pd.to_numeric(df_clean['total_costo'].astype(str).str.replace(',', '', regex=False), errors='coerce').fillna(0.0)
+            df_clean['costo_unit_trans'] = pd.to_numeric(df_clean['costo_unit_trans'].astype(str).str.replace(',', '', regex=False), errors='coerce').fillna(0.0)
+            df_clean['fecha'] = pd.to_datetime(df_clean['fecha'], format='mixed', dayfirst=True)
+            df_clean = df_clean[df_clean['sku'] != 'MASS1575']
     else:
-        df_reposicion = pd.DataFrame(columns=['sku', 'fecha', 'cantidad'])
-        # Fallback a reportes individuales si existieran
+        # Fallback a reportes individuales solo si no hay ningún archivo de ventas
         reports = [i + 4 for i in range(12)]
         dfs = []
         for r in reports:
@@ -641,7 +649,67 @@ def cargar_datos_base(mtime_tranz=0.0, mtime_ventas=0.0, mtime_art=0.0, mtime_co
         else:
             df_clean = pd.DataFrame(columns=['sku', 'fecha', 'nombre_trans', 'cantidad', 'total_venta', 'total_costo', 'costo_unit_trans'])
     
-    # 2. Extraer fallback de nombres de las transacciones (limpieza optimizada solo en SKUs únicos)
+    # 2. Historial de compras (FCO) y reposición neta histórica (FCO - DEC)
+    # Extraído de tranzabilidad.csv si existe (ventas.csv solo contiene facturas de venta FVE)
+    # JAMÁS se utiliza tranzabilidad para ventas ni para cálculo ABC
+    rutas_tranz = obtener_rutas_tranzabilidad()
+    df_fco_ult = pd.DataFrame(columns=['sku', 'ultima_fecha_fco'])
+    df_reposicion = pd.DataFrame(columns=['sku', 'fecha', 'cantidad'])
+    
+    if rutas_tranz:
+        dfs_tranz = []
+        for r_tranz in rutas_tranz:
+            df_temp = None
+            for enc in ['utf-8-sig', 'cp1252', 'latin1']:
+                try:
+                    df_temp = pd.read_csv(r_tranz, encoding=enc, low_memory=False)
+                    break
+                except Exception:
+                    continue
+            if df_temp is not None and not df_temp.empty:
+                df_temp.columns = [c.strip() for c in df_temp.columns]
+                dfs_tranz.append(df_temp)
+                
+        df_tranz = pd.concat(dfs_tranz, ignore_index=True) if dfs_tranz else pd.DataFrame()
+        if not df_tranz.empty:
+            for col in df_tranz.select_dtypes(include=['object']).columns:
+                df_tranz[col] = df_tranz[col].astype(str).str.strip()
+            df_tranz = df_tranz.drop_duplicates()
+            
+            col_art_t = next(
+                (c for c in df_tranz.columns if c.strip().lower() in ['artículo', 'articulo', 'art\xedculo']),
+                next((c for c in df_tranz.columns if 'art' in c.lower() and 'cat' not in c.lower() and 'padre' not in c.lower() and 'digo' not in c.lower()), df_tranz.columns[4] if len(df_tranz.columns) > 4 else df_tranz.columns[0])
+            )
+            col_tipo_t = next((c for c in df_tranz.columns if 'tipo' in c.lower() and 'trans' in c.lower()), None)
+            col_fecha_t = next((c for c in df_tranz.columns if 'fecha' in c.lower()), None)
+            col_cant_t = next((c for c in df_tranz.columns if 'cantidad' in c.lower()), None)
+            
+            if col_tipo_t and col_fecha_t and col_cant_t:
+                df_tranz['sku'] = df_tranz[col_art_t].astype(str).apply(lambda x: x.split('-')[0].strip())
+                df_tranz['fecha'] = pd.to_datetime(df_tranz[col_fecha_t], format='mixed', dayfirst=True)
+                df_tranz['cantidad'] = pd.to_numeric(df_tranz[col_cant_t].astype(str).str.replace(',', '', regex=False), errors='coerce').fillna(0.0)
+                
+                tipo_str = df_tranz[col_tipo_t].astype(str)
+                is_fco = tipo_str.str.startswith('FCO')
+                is_dec = tipo_str.str.startswith('DEC')
+                
+                # Historial de compras FCO para trazabilidad de reposición
+                df_fco = df_tranz[is_fco].copy()
+                if not df_fco.empty:
+                    df_fco_ult = df_fco.groupby('sku')['fecha'].max().reset_index()
+                    df_fco_ult.columns = ['sku', 'ultima_fecha_fco']
+                    df_fco_ult['sku'] = df_fco_ult['sku'].astype(str).str.strip()
+                    df_fco_ult = df_fco_ult[df_fco_ult['sku'] != 'MASS1575']
+                    
+                # Reposición Neta Histórica = FCO (+) menos DEC (-)
+                df_repo = df_tranz[is_fco | is_dec].copy()
+                if not df_repo.empty:
+                    df_repo['cantidad'] = np.where(df_repo[col_tipo_t].astype(str).str.startswith('FCO'), df_repo['cantidad'], -df_repo['cantidad'])
+                    df_reposicion = df_repo[['sku', 'fecha', 'cantidad']].copy()
+                    df_reposicion['sku'] = df_reposicion['sku'].astype(str).str.strip()
+                    df_reposicion = df_reposicion[df_reposicion['sku'] != 'MASS1575']
+    
+    # 3. Extraer fallback de nombres de las transacciones (limpieza optimizada solo en SKUs únicos)
     df_nombres_trans = df_clean[['sku', 'nombre_trans']].drop_duplicates(subset=['sku'], keep='last').copy()
     df_nombres_trans['nombre_trans'] = df_nombres_trans['nombre_trans'].astype(str).apply(limpiar_mojibake)
     
@@ -812,20 +880,20 @@ def cargar_datos_base(mtime_tranz=0.0, mtime_ventas=0.0, mtime_art=0.0, mtime_co
     return df_clean, df_art_clean[['sku', 'stock_actual', 'categoria']], df_metadata, df_info_prod, df_stock_transito, df_p2p, df_fco_ult, df_reposicion
 
 # Timestamps de invalidacion de cache
-p_tr = obtener_ruta_data('tranzabilidad.csv')
-p_v = obtener_ruta_data('ventas.csv')
+rutas_ventas_activas = obtener_rutas_ventas()
+mtime_ventas = tuple((f, os.path.getmtime(f)) for f in rutas_ventas_activas if os.path.exists(f))
+rutas_tranz_activas = obtener_rutas_tranzabilidad()
+mtime_tranz = tuple((f, os.path.getmtime(f)) for f in rutas_tranz_activas if os.path.exists(f))
 p_a = obtener_ruta_data('articulos.xlsx')
 p_c = obtener_ruta_data('consolidado.csv')
 p_img = obtener_ruta_data('images.csv')
 if not os.path.exists(p_img):
     p_img = obtener_ruta_data('IMAGES.csv')
-mtime_tranz = os.path.getmtime(p_tr) if os.path.exists(p_tr) else 0.0
-mtime_ventas = os.path.getmtime(p_v) if os.path.exists(p_v) else 0.0
 mtime_art = os.path.getmtime(p_a) if os.path.exists(p_a) else 0.0
 mtime_cons = os.path.getmtime(p_c) if os.path.exists(p_c) else 0.0
 mtime_img = os.path.getmtime(p_img) if os.path.exists(p_img) else 0.0
 
-df_trans, df_art, df_metadata, df_info_prod, df_stock_transito, df_p2p, df_fco_ult, df_reposicion = cargar_datos_base(mtime_tranz, mtime_ventas, mtime_art, mtime_cons, mtime_img)
+df_trans, df_art, df_metadata, df_info_prod, df_stock_transito, df_p2p, df_fco_ult, df_reposicion = cargar_datos_base(mtime_ventas, mtime_tranz, mtime_art, mtime_cons, mtime_img)
 
 # Excluir de forma global y permanente el SKU MASS1350 de todo el sistema
 df_trans = df_trans[df_trans['sku'] != 'MASS1350']
@@ -843,7 +911,7 @@ with st.sidebar:
     st.markdown("### Motor de logística para compras masivas")
     st.caption("Panel de Control y Compras Estratégicas")
     
-    if st.button("🔄 Recargar Base de Datos (Limpiar Caché)", use_container_width=True, help="Fuerza la recarga de data/ventas.csv y data/articulos.xlsx"):
+    if st.button("🔄 Recargar Base de Datos (Limpiar Caché)", use_container_width=True, help="Fuerza la recarga de transacciones y data/articulos.xlsx"):
         st.cache_data.clear()
         st.rerun()
         
@@ -907,9 +975,9 @@ with st.sidebar:
         "Margen de Stock de Seguridad (% adicional):",
         min_value=0,
         max_value=100,
-        value=0,
+        value=20,
         step=5,
-        help="Por defecto en 0% para no sobrestimar pedidos. Un valor de 0% calcula el ROP exactamente sobre la Demanda Esperada en Lead Time sin colchón adicional.",
+        help="Colchón adicional sobre el Stock de Seguridad estándar (Z * σ_m * √LT_m). Por defecto en 20% para asegurar cobertura estocástica ante variaciones de demanda.",
         key="sidebar_factor_ss"
     )
     factor_ss = factor_ss_pct / 100.0
@@ -928,164 +996,91 @@ with st.sidebar:
     st.caption("Masshopping Supply Chain Portal v3.0")
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 4. MOTOR VECTORIZADO DE CALCULO
+# 4. MOTOR VECTORIZADO DE CALCULO (FRECUENCIA MENSUAL UNIFICADA)
 # ══════════════════════════════════════════════════════════════════════════════
+# SKUs excluidos/ignorados completamente para la reposición (no reordenar, 0 cajas sugeridas)
+SKUS_IGNORAR_REPOSICION = set(
+    [f"MASS{i:04d}" for i in range(3000, 3062)] +
+    ['MASS3063', 'MASS3065', 'MASS3066', 'MASS0722']
+)
+
 @st.cache_data
-def ejecutar_motor(df_t, _df_a, _df_m, _df_info, _df_transit, _df_fco, lt, flete, cap_cont, tasa, c_orden, lookback_weeks=None, factor_ss=0.0):
+def ejecutar_motor(df_t, _df_a, _df_m, _df_info, _df_transit, _df_fco, lt, flete, cap_cont, tasa, c_orden, lookback_months=None, factor_ss=0.0, _df_trans_global=None, _engine_version="v5_mensual_puro"):
     lt = int(lt)
     # Lead Time mensual equivalente (3.5 meses para 15 semanas)
     lt_m = 3.5 if lt == 15 else round(lt / (52.0 / 12.0), 2)
     lt_m_roll = max(1, int(round(lt_m)))
-    df_semanal = df_t.groupby(['sku', pd.Grouper(key='fecha', freq='W-MON')])['cantidad'].sum().unstack(fill_value=0.0)
+    
+    # ── 1. AGREGACIÓN EXCLUSIVAMENTE MENSUAL COMO ÚNICA FUENTE DE VERDAD ──
     df_mensual = df_t.groupby(['sku', pd.Grouper(key='fecha', freq='MS')])['cantidad'].sum().unstack(fill_value=0.0)
     
-    # ── CÁLCULO SKU POR SKU ULTRA OPTIMIZADO (NUMPY 2D) ──
-    skus = df_semanal.index.tolist()
-    w_mat = df_semanal.values
+    # Fecha real de primera venta (a partir del histórico global completo) y límites de ventana
+    if _df_trans_global is not None and not _df_trans_global.empty:
+        fecha_primera = _df_trans_global.groupby('sku')['fecha'].min()
+        fecha_max_global = _df_trans_global['fecha'].max()
+    else:
+        fecha_primera = df_t.groupby('sku')['fecha'].min()
+        fecha_max_global = df_t['fecha'].max() if not df_t.empty else datetime.datetime.now()
+        
+    fecha_min_ventana = df_t['fecha'].min() if not df_t.empty else fecha_max_global
+    
+    skus = df_mensual.index.tolist()
     m_mat = df_mensual.values
+    meses_cols = df_mensual.columns
     n_skus = len(skus)
     
     adi_umbral = 1.32
     cv2_umbral = 0.49
     percentil_ss = 90
     winsor_percentil = 0.95
+    SEMANAS_POR_MES = 52.0 / 12.0  # Factor de conversión dimensional exacto (4.333333...)
     
     resultados = []
     for i in range(n_skus):
         sku = skus[i]
-        w_row = w_mat[i]
         m_row = m_mat[i]
         
-        # ── 1. MOTOR SEMANAL ──
-        if w_row.sum() == 0:
+        # Fecha real de primera venta y longitud real de historial
+        f_prim = fecha_primera.get(sku, None)
+        if pd.notnull(f_prim):
+            dias_hist = max(1, (fecha_max_global - f_prim).days)
+            meses_hist = dias_hist / 30.44
+            
+            # Si el producto ya existía antes del inicio de la ventana analizada,
+            # no se deben recortar los ceros iniciales: son períodos reales de inactividad/agotado.
+            if f_prim <= fecha_min_ventana:
+                ts_trim_m = m_row
+            else:
+                # El producto nació genuinamente dentro de la ventana analizada (producto nuevo)
+                f_prim_mes = pd.Timestamp(f_prim.date()).replace(day=1)
+                col_indices = np.where(meses_cols >= f_prim_mes)[0]
+                first_idx = col_indices[0] if len(col_indices) > 0 else 0
+                ts_trim_m = m_row[first_idx:]
+        else:
+            meses_hist = float(len(m_row))
+            ts_trim_m = m_row
+            
+        if m_row.sum() == 0 or len(ts_trim_m) == 0:
             res_sku = {
-                'sku': sku, 'cuadrante': 'sin_datos', 'adi': 0, 'cv': np.nan, 'n_pos': 0,
+                'sku': sku, 'cuadrante': 'sin_datos', 'adi': 0.0, 'cv': np.nan, 'cv2': np.nan,
+                'n_pos': 0, 'meses_historial': meses_hist,
+                'demanda_mensual_prom': 0.0, 'demanda_mensual_std': 0.0,
                 'demanda_semanal_prom': 0.0, 'demanda_semanal_std': 0.0,
                 'media_movil_4sem': 0.0, 'tendencia': 'Sin Datos',
                 'mu_sba': 0.0, 'demanda_esperada_lt': 0.0, 'ss_empirico': 0.0, 'rop': 0.0
             }
         else:
-            nz = np.nonzero(w_row)[0]
-            first_idx = nz[0]
-            ts_trim = w_row[first_idx:]
-            
-            if lookback_weeks is not None and len(ts_trim) > lookback_weeks:
-                ts_win_slice = ts_trim[-lookback_weeks:]
+            if lookback_months is not None and len(ts_trim_m) > lookback_months:
+                ts_win_slice = ts_trim_m[-lookback_months:]
             else:
-                ts_win_slice = ts_trim
+                ts_win_slice = ts_trim_m
                 
-            n_per = len(ts_win_slice)
-            pos = ts_win_slice[ts_win_slice > 0]
-            n_pos = len(pos)
-            adi = n_per / n_pos if n_pos > 0 else float('inf')
-            
-            if n_pos <= 1:
-                cuad = 'sin_datos'
-                cv2 = np.nan
-                cv = np.nan
-            else:
-                mu_p = pos.mean()
-                std_p = pos.std(ddof=1)
-                cv2 = (std_p / mu_p)**2 if mu_p > 0 else 0.0
-                cv = std_p / mu_p if mu_p > 0 else 0.0
-                if adi < adi_umbral and cv2 < cv2_umbral:
-                    cuad = 'smooth'
-                elif adi >= adi_umbral and cv2 < cv2_umbral:
-                    cuad = 'intermittent'
-                elif adi < adi_umbral and cv2 >= cv2_umbral:
-                    cuad = 'erratic'
-                else:
-                    cuad = 'lumpy'
-                    
-            if n_pos >= 2:
-                clip_val = np.percentile(pos, winsor_percentil * 100)
-                ts_win = np.clip(ts_win_slice, a_min=None, a_max=clip_val)
-            else:
-                ts_win = ts_win_slice.copy()
-                
-            mu_incond = ts_win.mean()
-            mu_4w = ts_win[-4:].mean() if len(ts_win) >= 4 else mu_incond
-            
-            # Cálculo de tendencia robusta y legible (últimas 4 semanas vs 4 semanas anteriores)
-            if len(ts_win) >= 8:
-                prev_4w = ts_win[-8:-4].mean()
-                diff_abs = mu_4w - prev_4w
-                if prev_4w == 0 and mu_4w == 0:
-                    tendencia_txt = "⏸️ Sin ventas"
-                elif prev_4w > 0 and mu_4w == 0:
-                    tendencia_txt = "🔴 -100% (Agotado/Parado)"
-                elif prev_4w == 0 and mu_4w > 0:
-                    tendencia_txt = f"🟢 Reactivado (+{mu_4w:.1f}/s)"
-                else:
-                    pct = (diff_abs / prev_4w) * 100.0
-                    # Si el volumen base era insignificante (<1 ud/sem), evitar porcentajes inflados de +800%
-                    if prev_4w < 1.0 and pct > 100:
-                        tendencia_txt = f"📈 En alza (+{diff_abs:.1f} uds/s)"
-                    elif pct >= 15:
-                        tendencia_txt = f"📈 +{pct:.0f}%"
-                    elif pct <= -15:
-                        tendencia_txt = f"📉 {pct:.0f}%"
-                    else:
-                        tendencia_txt = "➡️ Estable"
-            elif len(ts_win) >= 4:
-                tendencia_txt = f"🆕 Reciente ({mu_4w:.1f} uds/s)" if mu_4w > 0 else "🆕 Reciente (Sin ventas)"
-            else:
-                tendencia_txt = "🆕 Nuevo (<4 sem)"
-            
-            if len(ts_win) > 1:
-                alpha = 2.0 / (min(8, len(ts_win)) + 1.0)
-                weights = (1 - alpha) ** np.arange(len(ts_win))[::-1]
-                mu_ewma = (ts_win * weights).sum() / weights.sum()
-            else:
-                mu_ewma = mu_incond
-                
-            if len(ts_win) <= 12 and ts_win[0] > 2.0 * max(mu_4w, 0.1):
-                mu_vel = min(mu_ewma, mu_4w)
-            elif mu_4w < mu_incond:
-                mu_vel = 0.7 * mu_4w + 0.3 * mu_incond
-            else:
-                mu_vel = mu_incond
-                
-            if cuad == 'intermittent' and not np.isnan(cv2):
-                mu_sba = max(0.0, mu_vel * (1.0 - cv2 / 2.0))
-            else:
-                mu_sba = mu_vel
-                
-            dem_lt = mu_sba * lt
-            
-            if cuad in ('lumpy', 'intermittent') and len(ts_win) >= lt:
-                roll_sums = np.convolve(ts_win, np.ones(lt), mode='valid')
-                errors = roll_sums - dem_lt
-                ss_emp = max(0.0, float(np.percentile(errors, percentil_ss))) * factor_ss
-            else:
-                ss_emp = 0.0
-                
-            rop_w = dem_lt + ss_emp
-            res_sku = {
-                'sku': sku, 'cuadrante': cuad, 'adi': adi, 'cv': cv if not np.isnan(cv) else 0.0,
-                'n_pos': n_pos, 'demanda_semanal_prom': mu_vel,
-                'demanda_semanal_std': float(ts_win_slice.std(ddof=1)) if len(ts_win_slice) > 1 else 0.0,
-                'media_movil_4sem': float(round(mu_4w, 1)),
-                'tendencia': tendencia_txt,
-                'mu_sba': mu_sba, 'demanda_esperada_lt': dem_lt, 'ss_empirico': ss_emp, 'rop': rop_w
-            }
-            
-        # ── 2. MOTOR MENSUAL (LT = 3.5 meses) ──
-        if m_row.sum() == 0:
-            res_sku.update({
-                'cuadrante_mensual': 'sin_datos', 'adi_mensual': 0, 'cv_mensual': 0.0, 'cv2_mensual': 0.0,
-                'demanda_mensual_prom': 0.0, 'demanda_mensual_std': 0.0, 'mu_sba_mensual': 0.0,
-                'demanda_esperada_lt_mensual': 0.0, 'ss_empirico_mensual': 0.0, 'rop_mensual': 0.0
-            })
-        else:
-            nz_m = np.nonzero(m_row)[0]
-            first_m_idx = nz_m[0]
-            ts_trim_m = m_row[first_m_idx:]
-            n_per_m = len(ts_trim_m)
-            pos_m = ts_trim_m[ts_trim_m > 0]
+            n_per_m = len(ts_win_slice)
+            pos_m = ts_win_slice[ts_win_slice > 0]
             n_pos_m = len(pos_m)
             adi_m = n_per_m / n_pos_m if n_pos_m > 0 else float('inf')
             
+            # Clasificación Syntetos-Boylan mensual
             if n_pos_m <= 1:
                 cuad_m = 'sin_datos'
                 cv2_m = np.nan
@@ -1093,8 +1088,8 @@ def ejecutar_motor(df_t, _df_a, _df_m, _df_info, _df_transit, _df_fco, lt, flete
             else:
                 mu_p_m = pos_m.mean()
                 std_p_m = pos_m.std(ddof=1)
-                cv2_m = (std_p_m / mu_p_m)**2 if mu_p_m > 0 else 0.0
                 cv_m = std_p_m / mu_p_m if mu_p_m > 0 else 0.0
+                cv2_m = cv_m ** 2
                 if adi_m < adi_umbral and cv2_m < cv2_umbral:
                     cuad_m = 'smooth'
                 elif adi_m >= adi_umbral and cv2_m < cv2_umbral:
@@ -1104,15 +1099,17 @@ def ejecutar_motor(df_t, _df_a, _df_m, _df_info, _df_transit, _df_fco, lt, flete
                 else:
                     cuad_m = 'lumpy'
                     
+            # Winsorización
             if n_pos_m >= 2:
                 clip_val_m = np.percentile(pos_m, winsor_percentil * 100)
-                ts_win_m = np.clip(ts_trim_m, a_min=None, a_max=clip_val_m)
+                ts_win_m = np.clip(ts_win_slice, a_min=None, a_max=clip_val_m)
             else:
-                ts_win_m = ts_trim_m.copy()
+                ts_win_m = ts_win_slice.copy()
                 
             mu_incond_m = ts_win_m.mean()
             mu_3m = ts_win_m[-3:].mean() if len(ts_win_m) >= 3 else mu_incond_m
             
+            # EWMA Mensual
             if len(ts_win_m) > 1:
                 alpha_m = 2.0 / (min(4, len(ts_win_m)) + 1.0)
                 weights_m = (1 - alpha_m) ** np.arange(len(ts_win_m))[::-1]
@@ -1120,13 +1117,13 @@ def ejecutar_motor(df_t, _df_a, _df_m, _df_info, _df_transit, _df_fco, lt, flete
             else:
                 mu_ewma_m = mu_incond_m
                 
+            # Demanda representativa mensual
             if len(ts_win_m) <= 4 and ts_win_m[0] > 2.0 * max(mu_3m, 0.1):
                 mu_vel_m = min(mu_ewma_m, mu_3m)
-            elif mu_3m < mu_incond_m:
-                mu_vel_m = 0.7 * mu_3m + 0.3 * mu_incond_m
             else:
                 mu_vel_m = mu_incond_m
                 
+            # Corrección SBA para series intermitentes
             if cuad_m == 'intermittent' and not np.isnan(cv2_m):
                 mu_sba_m = max(0.0, mu_vel_m * (1.0 - cv2_m / 2.0))
             else:
@@ -1134,25 +1131,74 @@ def ejecutar_motor(df_t, _df_a, _df_m, _df_info, _df_transit, _df_fco, lt, flete
                 
             dem_lt_m = mu_sba_m * lt_m
             
-            if cuad_m in ('lumpy', 'intermittent') and len(ts_win_m) >= lt_m_roll:
-                roll_sums_m = np.convolve(ts_win_m, np.ones(lt_m_roll), mode='valid')
-                errors_m = roll_sums_m - (mu_sba_m * lt_m_roll)
-                ss_emp_m = max(0.0, float(np.percentile(errors_m, percentil_ss))) * factor_ss
+            # Sin Stock de Seguridad: ROP = Demanda esperada en Lead Time
+            ss_emp_m = 0.0
+            rop_m = dem_lt_m 
+            
+            # Métricas mensuales primarias
+            demanda_mensual_prom = mu_sba_m
+            demanda_mensual_std = float(ts_trim_m.std(ddof=1)) if len(ts_trim_m) > 1 else 0.0
+            
+            # Métricas derivadas deterministas (Consistencia dimensional: mu_w = mu_m / 4.333)
+            demanda_semanal_prom = demanda_mensual_prom / SEMANAS_POR_MES
+            demanda_semanal_std = demanda_mensual_std / math.sqrt(SEMANAS_POR_MES) if demanda_mensual_std > 0 else 0.0
+            media_movil_4sem = mu_3m / SEMANAS_POR_MES
+            
+            # Tendencia mensual robusta
+            if len(ts_win_m) >= 6:
+                prev_3m = ts_win_m[-6:-3].mean()
+                diff_abs = mu_3m - prev_3m
+                if prev_3m == 0 and mu_3m == 0:
+                    tendencia_txt = "⏸️ Sin ventas"
+                elif prev_3m > 0 and mu_3m == 0:
+                    tendencia_txt = "🔴 -100% (Agotado/Parado)"
+                elif prev_3m == 0 and mu_3m > 0:
+                    tendencia_txt = f"🟢 Reactivado (+{mu_3m:.1f}/m)"
+                else:
+                    pct = (diff_abs / prev_3m) * 100.0
+                    if prev_3m < 1.0 and pct > 100:
+                        tendencia_txt = f"📈 En alza (+{diff_abs:.1f} uds/m)"
+                    elif pct >= 15:
+                        tendencia_txt = f"📈 +{pct:.0f}%"
+                    elif pct <= -15:
+                        tendencia_txt = f"📉 {pct:.0f}%"
+                    else:
+                        tendencia_txt = "➡️ Estable"
+            elif len(ts_win_m) >= 3:
+                tendencia_txt = f"🆕 Reciente ({mu_3m:.1f} uds/m)" if mu_3m > 0 else "🆕 Reciente (Sin ventas)"
             else:
-                ss_emp_m = 0.0
+                tendencia_txt = "🆕 Nuevo (<3 meses)"
                 
-            rop_m = dem_lt_m + ss_emp_m
-            res_sku.update({
-                'cuadrante_mensual': cuad_m, 'adi_mensual': adi_m,
+            res_sku = {
+                'sku': sku,
+                'cuadrante': cuad_m,
+                'adi': adi_m,
+                'cv': cv_m if not np.isnan(cv_m) else 0.0,
+                'cv2': cv2_m if not np.isnan(cv2_m) else 0.0,
+                'n_pos': n_pos_m,
+                'meses_historial': meses_hist,
+                'demanda_mensual_prom': demanda_mensual_prom,
+                'demanda_mensual_std': demanda_mensual_std,
+                'demanda_semanal_prom': demanda_semanal_prom,
+                'demanda_semanal_std': demanda_semanal_std,
+                'media_movil_4sem': float(round(media_movil_4sem, 1)),
+                'tendencia': tendencia_txt,
+                'mu_sba': mu_sba_m,
+                'demanda_esperada_lt': dem_lt_m,
+                'ss_empirico': ss_emp_m,
+                'rop': rop_m,
+                # Aliases para compatibilidad transparente en todo el sistema
+                'cuadrante_mensual': cuad_m,
+                'adi_mensual': adi_m,
                 'cv_mensual': cv_m if not np.isnan(cv_m) else 0.0,
                 'cv2_mensual': cv2_m if not np.isnan(cv2_m) else 0.0,
-                'demanda_mensual_prom': mu_vel_m,
-                'demanda_mensual_std': float(ts_trim_m.std(ddof=1)) if len(ts_trim_m) > 1 else 0.0,
-                'mu_sba_mensual': mu_sba_m, 'demanda_esperada_lt_mensual': dem_lt_m,
-                'ss_empirico_mensual': ss_emp_m, 'rop_mensual': rop_m
-            })
+                'mu_sba_mensual': mu_sba_m,
+                'demanda_esperada_lt_mensual': dem_lt_m,
+                'ss_empirico_mensual': ss_emp_m,
+                'rop_mensual': rop_m
+            }
         resultados.append(res_sku)
-            
+        
     df_calc = pd.DataFrame(resultados)
     
     # ── COMBINACIÓN CON METADATA Y CLASIFICACIONES ──
@@ -1192,7 +1238,6 @@ def ejecutar_motor(df_t, _df_a, _df_m, _df_info, _df_transit, _df_fco, lt, flete
     else:
         df_calc['ultima_fecha_fco'] = pd.NaT
         
-    fecha_max_global = df_t['fecha'].max() if not df_t.empty else datetime.datetime.now()
     df_calc['dias_desde_fco'] = (fecha_max_global - df_calc['ultima_fecha_fco']).dt.days
     df_calc['estado_fco'] = np.where(
         df_calc['ultima_fecha_fco'].isna(),
@@ -1211,19 +1256,14 @@ def ejecutar_motor(df_t, _df_a, _df_m, _df_info, _df_transit, _df_fco, lt, flete
     df_calc['pct_ventas_total'] = (df_calc['total_ventas'] / v_tot * 100) if v_tot > 0 else 0.0
     df_calc['pct_ventas_acum'] = (pct_acum * 100)
     
-    # XYZ (Semanal)
+    # Clasificación XYZ Única (basada exclusivamente en CV mensual)
     df_calc['clase_xyz'] = np.select(
         [df_calc['cv'] <= 0.5, df_calc['cv'] <= 1.0],
         ['X', 'Y'], default='Z'
     )
     df_calc['clase_abc_xyz'] = df_calc['clase_abc'] + '-' + df_calc['clase_xyz']
-    
-    # XYZ (Mensual)
-    df_calc['clase_xyz_mensual'] = np.select(
-        [df_calc['cv_mensual'] <= 0.5, df_calc['cv_mensual'] <= 1.0],
-        ['X', 'Y'], default='Z'
-    )
-    df_calc['clase_abc_xyz_mensual'] = df_calc['clase_abc'] + '-' + df_calc['clase_xyz_mensual']
+    df_calc['clase_xyz_mensual'] = df_calc['clase_xyz']
+    df_calc['clase_abc_xyz_mensual'] = df_calc['clase_abc_xyz']
     
     # Nivel de Servicio
     ns_map = {
@@ -1234,41 +1274,43 @@ def ejecutar_motor(df_t, _df_a, _df_m, _df_info, _df_transit, _df_fco, lt, flete
     }
     df_calc['nivel_servicio'] = [ns_map.get((a, x), 0.85) for a, x in zip(df_calc['clase_abc'], df_calc['clase_xyz'])]
     
-    # Recalcular ROP y SS Gaussiano SEMANAL para Smooth/Erratic con factor_ss
-    mask_gauss = df_calc['cuadrante'].isin(['smooth', 'erratic'])
-    z_scores = stats.norm.ppf(df_calc.loc[mask_gauss, 'nivel_servicio'])
-    df_calc.loc[mask_gauss, 'ss_empirico'] = np.maximum(
-        0.0,
-        z_scores * df_calc.loc[mask_gauss, 'demanda_semanal_std'] * math.sqrt(lt) * factor_ss
-    )
-    df_calc.loc[mask_gauss, 'rop'] = df_calc.loc[mask_gauss, 'demanda_esperada_lt'] + df_calc.loc[mask_gauss, 'ss_empirico']
+    # Sin Stock de Seguridad: ROP es estrictamente la Demanda durante el Lead Time
+    df_calc['ss_empirico'] = 0.0
+    df_calc['ss_empirico_mensual'] = 0.0
+    df_calc['ss'] = 0.0
+    df_calc['ss_mensual'] = 0.0
     
-    # Recalcular ROP y SS Gaussiano MENSUAL para Smooth/Erratic con factor_ss
-    mask_gauss_m = df_calc['cuadrante_mensual'].isin(['smooth', 'erratic'])
-    z_scores_m = stats.norm.ppf(df_calc.loc[mask_gauss_m, 'nivel_servicio'])
-    df_calc.loc[mask_gauss_m, 'ss_empirico_mensual'] = np.maximum(
-        0.0,
-        z_scores_m * df_calc.loc[mask_gauss_m, 'demanda_mensual_std'] * math.sqrt(lt_m) * factor_ss
-    )
-    df_calc.loc[mask_gauss_m, 'rop_mensual'] = df_calc.loc[mask_gauss_m, 'demanda_esperada_lt_mensual'] + df_calc.loc[mask_gauss_m, 'ss_empirico_mensual']
+    df_calc['rop'] = df_calc['demanda_esperada_lt']
+    df_calc['rop_mensual'] = df_calc['rop']
     
-    # Umbrales Críticos de Stock (30% ROP)
+    # Umbral Crítico de Stock (30% ROP)
     df_calc['umbral_rop_30'] = df_calc['rop'] * 0.30
-    df_calc['umbral_rop_30_mensual'] = df_calc['rop_mensual'] * 0.30
+    df_calc['umbral_rop_30_mensual'] = df_calc['umbral_rop_30']
     
-    # ROP y EOQ generales (Semanal)
+    # ROP y EOQ generales (Anualizados a partir del modelo mensual)
     df_calc['cbm_unitario'] = df_calc['CBMM'] / df_calc['cantidad_por_caja']
     df_calc['flete_unitario_usd'] = df_calc['cbm_unitario'] * flete
     df_calc['costo_puesto'] = df_calc['costo'] + df_calc['flete_unitario_usd']
     
     h = df_calc['costo_puesto'] * tasa
-    d_anual = df_calc['demanda_semanal_prom'] * 52.0
+    d_anual = df_calc['demanda_mensual_prom'] * 12.0
     eoq = np.where(h > 0, np.sqrt(np.maximum(0.0, (2 * d_anual * c_orden) / h)), 0.0)
     eoq = np.nan_to_num(eoq, nan=0.0)
+    df_calc['eoq'] = eoq
+    df_calc['eoq_mensual'] = eoq
     
-    # Decision de pedido SEMANAL
+    # Decisión de pedido unificada (basada en ROP mensual)
     df_calc['requiere_pedido'] = df_calc['stock_total_disponible'] <= df_calc['rop']
+    
+    # Exclusión absoluta de reposición para SKUs configurados para ignorar completamente
+    es_ignorado_reposicion = df_calc['sku'].isin(SKUS_IGNORAR_REPOSICION)
+    df_calc.loc[es_ignorado_reposicion, 'requiere_pedido'] = False
+    
     df_calc['estado'] = np.where(df_calc['requiere_pedido'], 'REORDENAR', 'OK')
+    df_calc.loc[es_ignorado_reposicion, 'estado'] = 'IGNORADO'
+    
+    df_calc['requiere_pedido_mensual'] = df_calc['requiere_pedido']
+    df_calc['estado_mensual'] = df_calc['estado']
     
     cajas_sug = np.where(
         df_calc['requiere_pedido'],
@@ -1276,28 +1318,16 @@ def ejecutar_motor(df_t, _df_a, _df_m, _df_info, _df_transit, _df_fco, lt, flete
         0
     )
     df_calc['cajas_sugeridas'] = cajas_sug
+    df_calc['cajas_sugeridas_mensual'] = cajas_sug
     df_calc['pedir_cajas'] = df_calc['cajas_sugeridas']
     df_calc['incluir_en_pedido'] = False
     
-    # Decisión de pedido MENSUAL
-    d_anual_m = df_calc['demanda_mensual_prom'] * 12.0
-    eoq_m = np.where(h > 0, np.sqrt(np.maximum(0.0, (2 * d_anual_m * c_orden) / h)), 0.0)
-    eoq_m = np.nan_to_num(eoq_m, nan=0.0)
-    df_calc['eoq_mensual'] = eoq_m
-    df_calc['requiere_pedido_mensual'] = df_calc['stock_total_disponible'] <= df_calc['rop_mensual']
-    df_calc['estado_mensual'] = np.where(df_calc['requiere_pedido_mensual'], 'REORDENAR', 'OK')
-    df_calc['cajas_sugeridas_mensual'] = np.where(
-        df_calc['requiere_pedido_mensual'],
-        np.maximum(1, np.ceil(eoq_m / df_calc['cantidad_por_caja']).astype(int)),
-        0
-    )
-    
     return df_calc
 
-df_modelo = ejecutar_motor(df_trans_filtrada, df_art, df_metadata, df_info_prod, df_stock_transito, df_fco_ult, lead_time, flete_cbm, capacidad_cont, tasa_mant, costo_orden, factor_ss=factor_ss)
+df_modelo = ejecutar_motor(df_trans_filtrada, df_art, df_metadata, df_info_prod, df_stock_transito, df_fco_ult, lead_time, flete_cbm, capacidad_cont, tasa_mant, costo_orden, factor_ss=factor_ss, _df_trans_global=df_trans, _engine_version="v5_mensual_puro")
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 4.5 MOTOR SECUNDARIO: AGREGACIÓN MENSUAL (Para Fichas Visuales y Matrices)
+# 4.5 DATOS BASE PARA VISTAS (Fichas Visuales y Matrices)
 # ══════════════════════════════════════════════════════════════════════════════
 df_mensual_abc_xyz = df_modelo[[
     'sku', 'nombre', 'categoria', 'clase_abc', 'total_ventas',
@@ -1311,6 +1341,10 @@ df_mensual_abc_xyz['requiere_pedido'] = df_mensual_abc_xyz['requiere_pedido_mens
 
 # Listas de opciones cacheadas en memoria para agilizar renderizado de selectores
 etiquetas_catalogo = (df_modelo['sku'] + " -- " + df_modelo['nombre']).tolist()
+etiquetas_catalogo_reposicion = (
+    df_modelo[~df_modelo['sku'].isin(SKUS_IGNORAR_REPOSICION)]['sku'] + " -- " + 
+    df_modelo[~df_modelo['sku'].isin(SKUS_IGNORAR_REPOSICION)]['nombre']
+).tolist()
 todas_categorias_catalogo = sorted(df_modelo['categoria'].dropna().unique().tolist())
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1350,7 +1384,7 @@ with tab1:
         with r1_col1:
             busqueda_skus = st.multiselect(
                 "Buscar producto por Codigo SKU o Descripcion (Autocompletado):",
-                options=etiquetas_catalogo,
+                options=etiquetas_catalogo_reposicion,
                 placeholder="Escribe codigo o palabra para buscar...",
                 key="multiselect_busqueda_sku_t1"
             )
@@ -1374,13 +1408,13 @@ with tab1:
     # Aplicar filtros: si se busca un producto específico, mostrarlo directamente
     if busqueda_skus:
         codigos_buscar = [s.split(" -- ")[0] for s in busqueda_skus]
-        mask = df_modelo['sku'].isin(codigos_buscar)
+        mask = df_modelo['sku'].isin(codigos_buscar) & (~df_modelo['sku'].isin(SKUS_IGNORAR_REPOSICION))
     else:
         mask = (
             df_modelo['estado'].isin(f_estado) &
             df_modelo['clase_abc'].isin(f_abc) &
             df_modelo['clase_xyz'].isin(f_xyz) &
-            (~df_modelo['sku'].isin(['MASS3063', 'MASS3065', 'MASS3066']))
+            (~df_modelo['sku'].isin(SKUS_IGNORAR_REPOSICION))
         )
         if f_categoria:
             mask = mask & (df_modelo['categoria'].isin(f_categoria))
@@ -1413,9 +1447,8 @@ with tab1:
         
     # Tabla editable
     cols_editor = [
-        'incluir_en_pedido', 'imagen_url', 'sku', 'nombre', 'categoria', 'clase_abc_xyz',
-        'estado_fco', 'stock_actual', 'stock_transito', 'rop', 'rop_mensual', 'demanda_semanal_prom', 'demanda_mensual_prom', 'pedir_cajas',
-        'cantidad_por_caja', 'CBMM', 'costo', 'costo_puesto'
+        'incluir_en_pedido', 'imagen_url', 'sku', 'nombre', 'clase_abc_xyz',
+        'estado_fco', 'stock_actual', 'stock_transito', 'rop', 'demanda_mensual_prom'
     ]
     
     v_editor_t1 = st.session_state.get('v_editor_t1', 0)
@@ -1426,29 +1459,24 @@ with tab1:
             "imagen_url": st.column_config.ImageColumn("Foto", help="Foto oficial del producto Masshopping"),
             "sku": st.column_config.TextColumn("Codigo SKU", width="small"),
             "nombre": st.column_config.TextColumn("Nombre del Producto", width="large"),
-            "categoria": st.column_config.TextColumn("Categoria", width="medium"),
             "clase_abc_xyz": st.column_config.TextColumn("Segmento", width="small"),
             "estado_fco": st.column_config.TextColumn("Última Compra", width="medium", help="Fecha o días transcurridos desde la última FCO"),
-            "pedir_cajas": st.column_config.NumberColumn("Cajas a Pedir", min_value=0, step=1),
-            "stock_actual": st.column_config.NumberColumn("Stock", format="%.0f"),
-            "stock_transito": st.column_config.NumberColumn("En Transito", format="%.0f", help="Stock en contenedores Julio/Egipto"),
-            "rop": st.column_config.NumberColumn("ROP Semanal", format="%.1f", help=f"Punto de reorden semanal (LT={lead_time} sem)"),
-            "rop_mensual": st.column_config.NumberColumn("ROP Mensual", format="%.1f", help="Punto de reorden mensual (LT=3.5 meses)"),
-            "demanda_semanal_prom": st.column_config.NumberColumn("Demanda/Sem", format="%.1f"),
+            "stock_actual": st.column_config.NumberColumn("Stock Actual", format="%.0f"),
+            "stock_transito": st.column_config.NumberColumn("Stock en Tránsito", format="%.0f", help="Stock en contenedores en tránsito"),
+            "rop": st.column_config.NumberColumn("Punto Reorden (ROP)", format="%.1f", help=f"Punto de reorden mensual unificado (LT={lt_m_equiv} meses)"),
             "demanda_mensual_prom": st.column_config.NumberColumn("Demanda/Mes", format="%.1f"),
-            "CBMM": st.column_config.NumberColumn("CBM/Caja", format="%.3f"),
-            "costo": st.column_config.NumberColumn("Costo FOB ($)", format="$%.2f"),
-            "costo_puesto": st.column_config.NumberColumn("Costo DDP ($)", format="$%.2f", help="Costo FOB + Flete unitario"),
         },
-        disabled=['imagen_url', 'sku', 'nombre', 'categoria', 'clase_abc_xyz', 'estado_fco', 'stock_actual', 'stock_transito', 'rop', 'rop_mensual', 'demanda_semanal_prom', 'demanda_mensual_prom', 'cantidad_por_caja', 'CBMM', 'costo', 'costo_puesto'],
+        disabled=['imagen_url', 'sku', 'nombre', 'clase_abc_xyz', 'estado_fco', 'stock_actual', 'stock_transito', 'rop', 'demanda_mensual_prom'],
         use_container_width=True,
         height=420,
         key=f"editor_masshopping_cont_{v_editor_t1}"
     )
     
     # Calculos en tiempo real para seleccionados (mínimo 1 caja si está marcado)
-    seleccionados = df_editado[df_editado['incluir_en_pedido']].copy()
-    seleccionados['pedir_cajas'] = np.maximum(1, pd.to_numeric(seleccionados['pedir_cajas'], errors='coerce').fillna(1).astype(int))
+    idx_sel = df_editado[df_editado['incluir_en_pedido']].index
+    seleccionados = df_vista.loc[idx_sel].copy()
+    seleccionados['incluir_en_pedido'] = True
+    seleccionados['pedir_cajas'] = np.maximum(1, pd.to_numeric(seleccionados.get('pedir_cajas', 1), errors='coerce').fillna(1).astype(int))
     seleccionados['cbm_total'] = seleccionados['pedir_cajas'] * seleccionados['CBMM']
     seleccionados['unidades_total'] = seleccionados['pedir_cajas'] * seleccionados['cantidad_por_caja']
     seleccionados['inversion_fob'] = seleccionados['unidades_total'] * seleccionados['costo']
@@ -1461,48 +1489,6 @@ with tab1:
     unidades_acumuladas = seleccionados['unidades_total'].sum()
     pct_llenado = min(100.0, (cbm_acumulado / capacidad_cont) * 100) if capacidad_cont > 0 else 0
     contenedores_totales = cbm_acumulado / capacidad_cont if capacidad_cont > 0 else 0
-    
-    st.markdown("<br>", unsafe_allow_html=True)
-    m_col1, m_col2, m_col3, m_col4 = st.columns(4)
-    with m_col1:
-        st.markdown(f"""
-        <div class="metric-box">
-            <div class="metric-label">Volumen Total CBM</div>
-            <div class="metric-value">{cbm_acumulado:,.2f} m3</div>
-        </div>
-        """, unsafe_allow_html=True)
-    with m_col2:
-        st.markdown(f"""
-        <div class="metric-box">
-            <div class="metric-label">Inversion FOB / DDP</div>
-            <div class="metric-value">${inversion_acumulada:,.2f}</div>
-            <div class="metric-delta">DDP Est.: ${inversion_ddp_acumulada:,.2f}</div>
-        </div>
-        """, unsafe_allow_html=True)
-    with m_col3:
-        st.markdown(f"""
-        <div class="metric-box">
-            <div class="metric-label">Empaque Total</div>
-            <div class="metric-value">{cajas_acumuladas:,} cajas</div>
-            <div class="metric-delta">{unidades_acumuladas:,} unidades ({len(seleccionados)} SKUs)</div>
-        </div>
-        """, unsafe_allow_html=True)
-    with m_col4:
-        st.markdown(f"""
-        <div class="metric-box">
-            <div class="metric-label">Ocupacion de Contenedor</div>
-            <div class="metric-value">{contenedores_totales:.2f} cont.</div>
-            <div class="metric-delta">{pct_llenado:.1f}% del 1er contenedor</div>
-        </div>
-        """, unsafe_allow_html=True)
-    
-    st.markdown("<br>", unsafe_allow_html=True)
-    st.progress(pct_llenado / 100.0)
-    
-    if cbm_acumulado > capacidad_cont:
-        st.warning(f"El volumen supera la capacidad de 1 contenedor ({capacidad_cont} CBM). Se requieren **{math.ceil(contenedores_totales)} contenedores**.")
-    elif pct_llenado >= 90:
-        st.success(f"Contenedor optimizado. Nivel de ocupacion: **{pct_llenado:.1f}%**.")
     
     st.markdown("<br>", unsafe_allow_html=True)
     if 'gsheet_success_msg' in st.session_state:
@@ -1529,7 +1515,8 @@ with tab1:
 # TAB 2: MATRIZ ABC-XYZ
 # ══════════════════════════════════════════════════════════════════════════════
 with tab2:
-    st.subheader("Matriz de Segmentacion de Demanda Masshopping")
+    st.subheader("Matriz de Segmentacion de Demanda Masshopping (Mensual)")
+    st.caption(f"Clasificación estratégica consolidada en frecuencia mensual. Nivel de rotación e importancia de ingresos (ABC) vs Volatilidad de demanda mensual (XYZ).")
     col_m1, col_m2 = st.columns(2)
     with col_m1:
         st.markdown("### Conteo de SKUs por Cuadrante")
@@ -1539,24 +1526,12 @@ with tab2:
         pct_reord = df_modelo.groupby(['clase_abc', 'clase_xyz'])['requiere_pedido'].mean().unstack(fill_value=0) * 100
         st.dataframe(pct_reord.style.format("{:.1f}%"), use_container_width=True)
 
-    st.markdown("---")
-    st.subheader("Simulación de Matriz Estratégica (Agregación Mensual)")
-    st.caption("Esta matriz muestra cómo se distribuyen los productos si la variabilidad (XYZ) se calcula agrupando las ventas por mes.")
-    col_m3, col_m4 = st.columns(2)
-    with col_m3:
-        st.markdown("### Conteo de SKUs Mensual")
-        st.dataframe(pd.crosstab(df_mensual_abc_xyz['clase_abc'], df_mensual_abc_xyz['clase_xyz'], margins=True, margins_name='Total'), use_container_width=True)
-    with col_m4:
-        st.markdown("### % que Requiere Reorden Inmediato (Matriz Mensual)")
-        pct_reord_m = df_mensual_abc_xyz.groupby(['clase_abc', 'clase_xyz'])['requiere_pedido'].mean().unstack(fill_value=0) * 100
-        st.dataframe(pct_reord_m.style.format("{:.1f}%"), use_container_width=True)
-
 # ══════════════════════════════════════════════════════════════════════════════
-# TAB 3: EXPLORADOR VISUAL & COMPARADOR (SIN ROP LINE, CON TENDENCIA)
+# TAB 3: EXPLORADOR VISUAL & COMPARADOR
 # ══════════════════════════════════════════════════════════════════════════════
 with tab3:
-    st.subheader("Ficha Tecnica y Comparador Historico de Productos")
-    st.caption("Selecciona uno o varios productos para comparar su evolucion historica de demanda semanal con linea de tendencia.")
+    st.subheader("Ficha Técnica y Comparador Histórico de Productos")
+    st.caption(f"Selecciona uno o varios productos para comparar su evolución histórica de demanda. Parámetros de inventario basados en el modelo mensual unificado (LT = {lt_m_equiv} meses).")
     
     lista_etiquetas = list(etiquetas_catalogo)
     
@@ -1605,102 +1580,115 @@ with tab3:
                 st.markdown(f"<h3 style='margin:0; color:#141E32;'>{item['nombre']}</h3>", unsafe_allow_html=True)
                 pct_v = float(item.get('pct_ventas_total', 0.0))
                 pct_a = float(item.get('pct_ventas_acum', 0.0))
-                cv_w = float(item.get('cv', 0.0))
-                cv_m = float(item.get('cv_mensual', 0.0))
+                cv_m = float(item.get('cv', 0.0))
                 st.markdown(f"""
                 <p style='color:#5AA06E; font-weight:700; margin-top:4px; margin-bottom:2px;'>
                     Codigo SKU: <span style='color:#141E32;'>{item['sku']}</span> | 
-                    Categoria: <span style='color:#141E32;'>{item['categoria']}</span> | 
                     Segmento: <span style='color:#141E32;'>{item['clase_abc_xyz']}</span>
                 </p>
                 <p style='font-size:12.5px; color:#2E5B3D; margin-top:2px; margin-bottom:12px; background:#F0F8F3; padding:6px 12px; border-radius:6px; border:1px solid #D5E7DB;'>
                     <b>📊 Justificación ABC:</b> Aporta el <b>{pct_v:.2f}%</b> de ventas totales (Pareto Acumulado: <b>{pct_a:.1f}%</b> → Clase <b>{item['clase_abc']}</b>) &nbsp;&bull;&nbsp; 
-                    <b>📈 Justificación XYZ:</b> CV Semanal: <b>{cv_w:.2f}</b> (Clase <b>{item['clase_xyz']}</b>) | CV Mensual: <b>{cv_m:.2f}</b> (Clase <b>{item['clase_xyz_mensual']}</b>)
+                    <b>📈 Justificación XYZ (Mensual):</b> CV Mensual: <b>{cv_m:.2f}</b> (Clase <b>{item['clase_xyz']}</b>)
                 </p>
                 """, unsafe_allow_html=True)
                 
-                estado_html = f'<span class="badge-status-reorden">REORDENAR</span>' if item['estado'] == 'REORDENAR' else f'<span class="badge-status-ok">OK</span>'
-                estado_m_html = f'<span class="badge-status-reorden">REORDENAR</span>' if item['estado_mensual'] == 'REORDENAR' else f'<span class="badge-status-ok">OK</span>'
-                
+                if item['estado'] == 'REORDENAR':
+                    estado_html = f'<span class="badge-status-reorden">REORDENAR</span>'
+                elif item['estado'] == 'IGNORADO':
+                    estado_html = f'<span class="badge-status-ignorado">IGNORADO</span>'
+                else:
+                    estado_html = f'<span class="badge-status-ok">OK</span>'
                 transit_val = item.get('stock_transito', 0)
+                adi_val = item.get('adi', 0.0)
+                adi_str = f"{adi_val:.2f}" if (pd.notnull(adi_val) and not np.isinf(adi_val)) else "N/A"
+                if pd.notnull(adi_val) and not np.isinf(adi_val) and float(adi_val) > 0:
+                    prob_pct = (1.0 / float(adi_val)) * 100.0
+                    prob_str = f"{prob_pct:.0f}%"
+                else:
+                    prob_str = "0%"
+                cv_val = item.get('cv', 0.0)
+                cv_str = f"{cv_val:.2f}" if pd.notnull(cv_val) else "0.00"
                 
                 st.markdown(f"""
-                <div class="kpi-grid" style="grid-template-columns: repeat(6, 1fr);">
+                <div class="kpi-grid" style="grid-template-columns: repeat(3, 1fr);">
                     <div class="kpi-card">
                         <div class="kpi-title">Stock Actual</div>
                         <div class="kpi-number">{item['stock_actual']:,.0f} unidades</div>
                     </div>
                     <div class="kpi-card">
-                        <div class="kpi-title">En Tránsito</div>
+                        <div class="kpi-title">Stock en Tránsito</div>
                         <div class="kpi-number">{transit_val:,.0f} unidades</div>
                     </div>
-                    <div class="kpi-card" style="border-top: 3px solid #E65100;">
-                        <div class="kpi-title" style="color:#C62828;">Umbral Crítico (30%)</div>
-                        <div class="kpi-number" style="color:#C62828;">{item['umbral_rop_30_mensual']:,.1f} unidades</div>
-                    </div>
-                    <div class="kpi-card">
-                        <div class="kpi-title">ROP Semanal (15 sem)</div>
-                        <div class="kpi-number">{item['rop']:,.1f} unidades</div>
-                    </div>
                     <div class="kpi-card" style="border-top: 3px solid #1E88E5;">
-                        <div class="kpi-title" style="color:#1565C0;">ROP Mensual (3.5 m)</div>
-                        <div class="kpi-number" style="color:#1565C0;">{item['rop_mensual']:,.1f} unidades</div>
+                        <div class="kpi-title" style="color:#1565C0;">Punto Reorden (ROP)</div>
+                        <div class="kpi-number" style="color:#1565C0;">{item['rop']:,.1f} unidades</div>
                     </div>
                     <div class="kpi-card">
-                        <div class="kpi-title">Estado (Sem / Mes)</div>
-                        <div style="margin-top:2px; font-size:11px;">{estado_html} / {estado_m_html}</div>
-                    </div>
-                    <div class="kpi-card">
-                        <div class="kpi-title">Demanda Semanal</div>
-                        <div class="kpi-number">{item['demanda_semanal_prom']:,.1f} unidades</div>
+                        <div class="kpi-title">Estado Inventario</div>
+                        <div style="margin-top:2px;">{estado_html}</div>
                     </div>
                     <div class="kpi-card" style="border-top: 3px solid #1E88E5;">
                         <div class="kpi-title" style="color:#1565C0;">Demanda Mensual</div>
-                        <div class="kpi-number" style="color:#1565C0;">{item['demanda_mensual_prom']:,.1f} unidades</div>
+                        <div class="kpi-number" style="color:#1565C0;">{item['demanda_mensual_prom']:,.1f} uds/m</div>
                     </div>
                     <div class="kpi-card">
                         <div class="kpi-title">Última Compra (FCO)</div>
                         <div class="kpi-number" style="font-size:12px; font-weight:700; color:#141E32;">{item.get('estado_fco', 'N/A')}</div>
                     </div>
                     <div class="kpi-card">
-                        <div class="kpi-title">Cuadrante Sem / Mes</div>
-                        <div class="kpi-number" style="font-size:13px;">{str(item['cuadrante']).upper()} / {str(item['cuadrante_mensual']).upper()}</div>
+                        <div class="kpi-title">Historial / Vida</div>
+                        <div class="kpi-number">{item['meses_historial']:.1f} meses</div>
                     </div>
                     <div class="kpi-card">
-                        <div class="kpi-title">Costo FOB / DDP</div>
-                        <div class="kpi-number" style="font-size:13px;">${item['costo']:,.2f} / ${item['costo_puesto']:,.2f}</div>
+                        <div class="kpi-title">Volatilidad (CV)</div>
+                        <div class="kpi-number">{cv_str}</div>
                     </div>
                     <div class="kpi-card">
-                        <div class="kpi-title">Nivel de Servicio</div>
-                        <div class="kpi-number">{item['nivel_servicio']:.0%}</div>
+                        <div class="kpi-title">ADI | 1/ADI (Prob.)</div>
+                        <div class="kpi-number">{adi_str} <span style="font-size:12.5px; font-weight:700; color:#2E7D32;">({prob_str})</span></div>
                     </div>
                 </div>
                 """, unsafe_allow_html=True)
         
         # 2. Grafico Comparativo con TENDENCIA e IMPACTO CAMBIARIO (P2P)
         st.markdown("<br>", unsafe_allow_html=True)
-        st.subheader("Comparativa Historica de Demanda Semanal vs Variacion Cambiaria")
-        st.caption("Linea de tendencia = promedio movil de 4 semanas. Linea naranja de fondo = Variacion porcentual interdiaria del USDT (Binance P2P).")
+        st.subheader("Comparativa Histórica de Demanda vs Variación Cambiaria")
+        st.caption("Gráfico analítico de evolución temporal con línea de tendencia ajustada e impacto cambiario interdiario.")
         
         # Local Date Range Filter for the Chart
         fecha_min_global = df_trans['fecha'].min().date() if not df_trans.empty else datetime.date(2023,1,1)
         fecha_max_global = df_trans['fecha'].max().date() if not df_trans.empty else datetime.date(2026,12,31)
                 
-        col_rango, col_chk1, col_chk2, col_chk3 = st.columns([2, 1, 1, 1.2])
+        col_freq, col_rango = st.columns([1.5, 2.5])
+        with col_freq:
+            freq_grafico = st.radio(
+                "Frecuencia de Agrupación Gráfica:",
+                ["🗓️ Mensual (Modelo Central)", "📅 Semanal (Descriptivo)"],
+                index=0,
+                horizontal=True,
+                key="radio_freq_grafico_tab3"
+            )
         with col_rango:
             rango_local = st.date_input(
-                "Rango de Fechas Específicas (Gráfico)",
+                "Rango de Fechas Específicas (Gráfico):",
                 value=(fecha_min_global, fecha_max_global),
                 key="rango_grafico_tab3"
             )
             
+        col_chk1, col_chk2, col_chk3, col_chk4 = st.columns(4)
         with col_chk1:
             mostrar_tendencia = st.checkbox("Mostrar Tendencia", value=False)
         with col_chk2:
-            mostrar_p2p = st.checkbox("Mostrar Variación USDT", value=False)
+            mostrar_promedio = st.checkbox("Mostrar Promedio", value=True, help="Muestra una recta constante con la demanda promedio")
         with col_chk3:
-            mostrar_reposicion = st.checkbox("Mostrar Reposición (FCO - DEC)", value=True, help="Muestra gráficos de compras netas efectivas (FCO - DEC)")
+            mostrar_p2p = st.checkbox("Mostrar Variación USDT (P2P)", value=False)
+        with col_chk4:
+            mostrar_reposicion = st.checkbox("Mostrar Reposición (FCO - DEC)", value=False, help="Muestra compras netas efectivas (FCO - DEC)")
             
+        is_mensual_chart = "Mensual" in freq_grafico
+        freq_code = 'MS' if is_mensual_chart else 'W-MON'
+        y_title_text = "Unidades Vendidas / Mes" if is_mensual_chart else "Unidades Vendidas / Semana"
+        
         # Apply local date filter to df_trans (full history)
         df_plot_trans = df_trans
         df_plot_repo = df_reposicion
@@ -1734,7 +1722,6 @@ with tab3:
         
         # Graficar Variacion P2P en el eje secundario (fondo)
         if mostrar_p2p and not df_p2p.empty:
-            # Obtener fecha minima de los skus seleccionados
             df_plot_skus = df_plot_trans[df_plot_trans['sku'].isin(skus_codigos)]
             fecha_min_sku = df_plot_skus['fecha'].min() if not df_plot_skus.empty else fecha_min_global
             
@@ -1749,16 +1736,16 @@ with tab3:
                 x=df_p2p_f['fecha'],
                 y=df_p2p_f['var_pct'],
                 mode='lines',
-                name='Variacion USDT (P2P)',
-                line=dict(width=1, color='rgba(230, 81, 0, 0.4)'), # Naranja semi-transparente
+                name='Variación USDT (P2P)',
+                line=dict(width=1, color='rgba(230, 81, 0, 0.4)'),
                 fill='tozeroy',
                 fillcolor='rgba(230, 81, 0, 0.05)',
-                hovertemplate="<b>USDT P2P</b><br>Fecha: %{x|%d %b %Y}<br>Variacion: <b>%{y:.2f}%</b><extra></extra>"
+                hovertemplate="<b>USDT P2P</b><br>Fecha: %{x|%d %b %Y}<br>Variación: <b>%{y:.2f}%</b><extra></extra>"
             ), secondary_y=True)
         
         for idx, sku_code in enumerate(skus_codigos):
             df_hist_sku = df_plot_trans[df_plot_trans['sku'] == sku_code].copy()
-            serie = df_hist_sku.groupby(pd.Grouper(key='fecha', freq='W-MON'))['cantidad'].sum().reset_index()
+            serie = df_hist_sku.groupby(pd.Grouper(key='fecha', freq=freq_code))['cantidad'].sum().reset_index()
             serie = serie.sort_values('fecha')
             
             # Nombre para la leyenda
@@ -1777,26 +1764,43 @@ with tab3:
                 mode='lines+markers',
                 name=legend_name,
                 line=dict(width=2, color=color_linea),
-                marker=dict(size=4),
-                hovertemplate="<b>" + sku_code + "</b><br>Fecha: %{x|%d %b %Y}<br>Cantidad: <b>%{y:,.0f} uds</b><extra></extra>"
+                marker=dict(size=5),
+                hovertemplate="<b>" + sku_code + "</b><br>Fecha: %{x|%b %Y}<br>Cantidad: <b>%{y:,.0f} uds</b><extra></extra>"
             ), secondary_y=False)
             
-            # Linea de tendencia (promedio movil de 4 semanas)
-            if mostrar_tendencia and len(serie) >= 4:
-                serie['tendencia'] = serie['cantidad'].rolling(window=4, min_periods=2).mean()
+            # Métricas del modelo para rectas constantes de promedio
+            sku_m = df_modelo[df_modelo['sku'] == sku_code]
+            prom_val = float(sku_m['demanda_mensual_prom'].values[0]) if is_mensual_chart else float(sku_m['demanda_semanal_prom'].values[0]) if not sku_m.empty else 0.0
+
+            # Linea constante de Demanda Promedio
+            if mostrar_promedio and not serie.empty:
+                lbl_prom = f"Promedio {sku_code} ({prom_val:,.1f} uds)" if len(skus_codigos) > 1 else f"Demanda Promedio ({prom_val:,.1f} uds/{'mes' if is_mensual_chart else 'sem'})"
+                fig.add_trace(go.Scatter(
+                    x=[serie['fecha'].min(), serie['fecha'].max()],
+                    y=[prom_val, prom_val],
+                    mode='lines',
+                    name=lbl_prom,
+                    line=dict(width=2, color=color_linea if len(skus_codigos) > 1 else '#1E88E5', dash='dashdot'),
+                    hovertemplate=f"<b>{lbl_prom}</b>: {prom_val:,.1f} uds<extra></extra>"
+                ), secondary_y=False)
+            
+            # Linea de tendencia
+            if mostrar_tendencia and len(serie) >= (3 if is_mensual_chart else 4):
+                win_size = 3 if is_mensual_chart else 4
+                serie['tendencia'] = serie['cantidad'].rolling(window=win_size, min_periods=1).mean()
                 fig.add_trace(go.Scatter(
                     x=serie['fecha'],
                     y=serie['tendencia'],
                     mode='lines',
                     name=f"Tendencia {sku_code}",
                     line=dict(width=2.5, color=color_linea, dash='dash'),
-                    hovertemplate="<b>Tendencia " + sku_code + "</b><br>Fecha: %{x|%d %b %Y}<br>Promedio movil: <b>%{y:,.1f} uds</b><extra></extra>",
+                    hovertemplate="<b>Tendencia " + sku_code + "</b><br>Fecha: %{x|%b %Y}<br>Promedio móvil: <b>%{y:,.1f} uds</b><extra></extra>",
                     showlegend=True
                 ), secondary_y=False)
         
         fig.update_layout(
-            height=650,
-            margin=dict(l=20, r=20, t=30, b=30),
+            height=600,
+            margin=dict(l=20, r=20, t=60, b=30),
             hovermode="x unified",
             xaxis=dict(
                 title="Fecha",
@@ -1805,24 +1809,28 @@ with tab3:
                 gridcolor="#EBF4EE"
             ),
             legend=dict(
-                orientation="v",
-                yanchor="top",
-                y=1,
-                xanchor="left",
-                x=1.02
+                orientation="h",
+                yanchor="bottom",
+                y=1.02,
+                xanchor="center",
+                x=0.5
             ),
             plot_bgcolor="#FFFFFF",
             paper_bgcolor="#FFFFFF"
         )
         
-        # Calcular y1_max para alinear ceros
+        # Calcular y1_max para alinear ceros considerando únicamente demanda real y promedio mensual
         y1_max = 0
         for sku_code in skus_codigos:
             df_hist_sku = df_plot_trans[df_plot_trans['sku'] == sku_code]
             if not df_hist_sku.empty:
-                serie_cant = df_hist_sku.groupby(pd.Grouper(key='fecha', freq='W-MON'))['cantidad'].sum()
+                serie_cant = df_hist_sku.groupby(pd.Grouper(key='fecha', freq=freq_code))['cantidad'].sum()
                 if not serie_cant.empty:
                     y1_max = max(y1_max, serie_cant.max())
+            sku_m = df_modelo[df_modelo['sku'] == sku_code]
+            if not sku_m.empty and mostrar_promedio:
+                p_v = float(sku_m['demanda_mensual_prom'].values[0]) if is_mensual_chart else float(sku_m['demanda_semanal_prom'].values[0])
+                y1_max = max(y1_max, p_v)
         y1_max = max(y1_max, 1)
 
         # Calcular y2_min y y2_max
@@ -1835,25 +1843,22 @@ with tab3:
         # Configurar rangos alineando el cero
         if y2_min < 0 < y2_max:
             y1_min = y1_max * (y2_min / y2_max)
-            fig.update_yaxes(title_text="Unidades Vendidas / Semana", showgrid=True, gridcolor="#EBF4EE", range=[y1_min, y1_max * 1.1], secondary_y=False)
-            fig.update_yaxes(title_text="Variacion USDT (%)", showgrid=False, range=[y2_min, y2_max * 1.1], secondary_y=True)
+            fig.update_yaxes(title_text=y_title_text, showgrid=True, gridcolor="#EBF4EE", range=[y1_min, y1_max * 1.1], secondary_y=False)
+            fig.update_yaxes(title_text="Variación USDT (%)", showgrid=False, range=[y2_min, y2_max * 1.1], secondary_y=True)
         else:
-            fig.update_yaxes(title_text="Unidades Vendidas / Semana", showgrid=True, gridcolor="#EBF4EE", range=[0, y1_max * 1.1], secondary_y=False)
+            fig.update_yaxes(title_text=y_title_text, showgrid=True, gridcolor="#EBF4EE", range=[0, y1_max * 1.1], secondary_y=False)
             if y2_min != y2_max:
-                fig.update_yaxes(title_text="Variacion USDT (%)", showgrid=False, range=[y2_min * 1.1, y2_max * 1.1], secondary_y=True)
+                fig.update_yaxes(title_text="Variación USDT (%)", showgrid=False, range=[y2_min * 1.1, y2_max * 1.1], secondary_y=True)
             else:
-                fig.update_yaxes(title_text="Variacion USDT (%)", showgrid=False, secondary_y=True)
+                fig.update_yaxes(title_text="Variación USDT (%)", showgrid=False, secondary_y=True)
 
-        # Agregar linea de referencia para el 0 de ambos ejes (coinciden en la misma altura)
         fig.add_hline(y=0, line_dash="dash", line_color="rgba(230, 81, 0, 0.8)", line_width=2, yref="y2")
-        
         st.plotly_chart(fig, use_container_width=True)
         
-        # Aggregate totals for selected SKUs in the selected date range
+        # Totales Agregados
         df_plot_skus = df_plot_trans[df_plot_trans['sku'].isin(skus_codigos)]
         if not df_plot_skus.empty:
             total_unidades = df_plot_skus['cantidad'].sum()
-            # Calculate total USD: merge with df_modelo to get costo
             df_plot_usd = pd.merge(df_plot_skus, df_modelo[['sku', 'costo']], on='sku', how='left')
             df_plot_usd['costo'] = df_plot_usd['costo'].fillna(0)
             total_usd = (df_plot_usd['cantidad'] * df_plot_usd['costo']).sum()
@@ -1864,23 +1869,23 @@ with tab3:
             with t_col1:
                 st.metric("Total Unidades Vendidas", f"{total_unidades:,.0f}")
             with t_col2:
-                st.metric("Total Costo", f"${total_usd:,.2f}")
+                st.metric("Total Costo (FOB)", f"${total_usd:,.2f}")
         else:
             st.info("No hay datos de venta en el rango seleccionado para los productos elegidos.")
 
-        # ── GRÁFICO DE REPOSICIÓN NETA SEMANAL (FCO - DEC) ──
+        # ── GRÁFICO DE REPOSICIÓN NETA (FCO - DEC) ──
         if mostrar_reposicion and len(skus_codigos) > 0:
             st.markdown("<br>", unsafe_allow_html=True)
-            st.subheader("Histórico de Reposición Neta Semanal (FCO - DEC)")
-            st.caption("Compras netas recibidas en inventario (Facturas de Compra FCO menos Devoluciones DEC) agrupadas por semana.")
+            st.subheader(f"Histórico de Reposición Neta ({'Mensual' if is_mensual_chart else 'Semanal'}) [FCO - DEC]")
+            st.caption("Compras netas recibidas en inventario (Facturas de Compra FCO menos Devoluciones DEC).")
             
-            fig_repo_w = go.Figure()
+            fig_repo = go.Figure()
             for idx, sku_code in enumerate(skus_codigos):
                 df_repo_sku = df_plot_repo[df_plot_repo['sku'] == sku_code].copy()
                 if not df_repo_sku.empty:
-                    s_repo_w = df_repo_sku.groupby(pd.Grouper(key='fecha', freq='W-MON'))['cantidad'].sum().reset_index().sort_values('fecha')
+                    s_repo = df_repo_sku.groupby(pd.Grouper(key='fecha', freq=freq_code))['cantidad'].sum().reset_index().sort_values('fecha')
                 else:
-                    s_repo_w = pd.DataFrame({'fecha': [], 'cantidad': []})
+                    s_repo = pd.DataFrame({'fecha': [], 'cantidad': []})
                     
                 nombre_label = df_modelo[df_modelo['sku'] == sku_code]['nombre'].values
                 nombre_label = nombre_label[0] if len(nombre_label) > 0 else sku_code
@@ -1889,27 +1894,27 @@ with tab3:
                 legend_name = f"{sku_code} ({nombre_label})"
                 color_azul = paleta_azul[idx % len(paleta_azul)]
                 
-                fig_repo_w.add_trace(go.Scatter(
-                    x=s_repo_w['fecha'],
-                    y=s_repo_w['cantidad'],
+                fig_repo.add_trace(go.Scatter(
+                    x=s_repo['fecha'],
+                    y=s_repo['cantidad'],
                     mode='lines+markers',
                     name=legend_name,
                     line=dict(width=2.5, color=color_azul),
                     marker=dict(size=6, color=color_azul),
-                    hovertemplate="<b>" + sku_code + " (Reposición Neta)</b><br>Semana: %{x|%d %b %Y}<br>FCO - DEC: <b>%{y:,.0f} uds</b><extra></extra>"
+                    hovertemplate="<b>" + sku_code + " (Reposición Neta)</b><br>Fecha: %{x|%b %Y}<br>FCO - DEC: <b>%{y:,.0f} uds</b><extra></extra>"
                 ))
                 
-            fig_repo_w.update_layout(
-                height=420,
-                margin=dict(l=20, r=20, t=30, b=30),
+            fig_repo.update_layout(
+                height=400,
+                margin=dict(l=20, r=20, t=60, b=30),
                 hovermode="x unified",
-                xaxis=dict(title="Fecha (Semana)", tickformat="%b %Y", showgrid=True, gridcolor="#EBF4EE"),
-                yaxis=dict(title="Unidades Repuestas (FCO - DEC) / Semana", showgrid=True, gridcolor="#EBF4EE"),
-                legend=dict(orientation="v", yanchor="top", y=1, xanchor="left", x=1.02),
+                xaxis=dict(title="Fecha", tickformat="%b %Y", showgrid=True, gridcolor="#EBF4EE"),
+                yaxis=dict(title=f"Unidades Repuestas (FCO - DEC) / {'Mes' if is_mensual_chart else 'Semana'}", showgrid=True, gridcolor="#EBF4EE"),
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="center", x=0.5),
                 plot_bgcolor="#FFFFFF",
                 paper_bgcolor="#FFFFFF"
             )
-            st.plotly_chart(fig_repo_w, use_container_width=True)
+            st.plotly_chart(fig_repo, use_container_width=True)
             
             # Totales agregados de reposición
             df_plot_repo_skus = df_plot_repo[df_plot_repo['sku'].isin(skus_codigos)]
@@ -1924,163 +1929,6 @@ with tab3:
                     st.metric("Total Unidades Repuestas (FCO - DEC)", f"{total_repo_uds:,.0f}")
                 with r_col2:
                     st.metric("Inversión Repuesta Estimada (FOB)", f"${total_repo_fob:,.2f}")
-
-        # =========================================================
-        # ANALISIS MENSUAL ADICIONAL (Agregación por Mes)
-        # =========================================================
-        st.markdown("---")
-        st.subheader("Simulación de Agregación Mensual")
-        st.caption("Si agregamos las ventas por MES en lugar de por semana, la variabilidad (CV2) y la intermitencia (ADI) se suavizan drásticamente. Observa cómo cambiaría la clasificación (Cuadrante) de los productos seleccionados bajo un modelo mensual.")
-        
-        if len(skus_codigos) > 0:
-            fig_m = make_subplots(specs=[[{"secondary_y": False}]])
-            resultados_mensuales = []
-            
-            for idx, sku_code in enumerate(skus_codigos):
-                df_hist_sku = df_plot_trans[df_plot_trans['sku'] == sku_code].copy()
-                
-                # Agregación mensual (MS = Month Start)
-                ts_mensual = df_hist_sku.groupby(pd.Grouper(key='fecha', freq='MS'))['cantidad'].sum()
-                serie_m = ts_mensual.reset_index().sort_values('fecha')
-                
-                color_linea = paleta_colores[idx % len(paleta_colores)]
-                fig_m.add_trace(go.Scatter(
-                    x=serie_m['fecha'], y=serie_m['cantidad'],
-                    mode='lines+markers', name=sku_code,
-                    line=dict(width=2, color=color_linea),
-                    marker=dict(size=6),
-                    hovertemplate="<b>" + sku_code + "</b><br>Mes: %{x|%b %Y}<br>Cantidad: <b>%{y:,.0f} uds</b><extra></extra>"
-                ))
-                
-                # Obtener métricas calculadas completas de df_modelo
-                m_row = df_modelo[df_modelo['sku'] == sku_code]
-                if not m_row.empty:
-                    mr = m_row.iloc[0]
-                    nom_prod = mr['nombre']
-                    if len(nom_prod) > 35:
-                        nom_prod = nom_prod[:35] + '...'
-                    clase_abc_val = mr['clase_abc']
-                    pct_v_tot = f"{mr.get('pct_ventas_total', 0.0):.2f}%"
-                    pct_v_acum = f"{mr.get('pct_ventas_acum', 0.0):.1f}%"
-                    
-                    # Semanal
-                    clase_xyz_w = mr['clase_xyz']
-                    cv_w_val = f"{mr['cv']:.2f}" if not np.isnan(mr['cv']) else 'N/A'
-                    cuad_w_str = str(mr['cuadrante']).upper()
-                    adi_w_val = f"{mr['adi']:.2f}"
-                    cv2_w_val = f"{(mr['cv']**2):.2f}" if not np.isnan(mr['cv']) else 'N/A'
-                    dem_w_val = f"{mr['demanda_semanal_prom']:.1f}"
-                    ss_w_val = f"{mr['ss_empirico']:.1f}"
-                    rop_w_val = f"{mr['rop']:.1f}"
-                    cajas_w_val = f"{mr['cajas_sugeridas']:,.0f}"
-                    est_w_val = mr['estado']
-                    
-                    # Mensual
-                    clase_xyz_m = mr['clase_xyz_mensual']
-                    cv_m_val = f"{mr['cv_mensual']:.2f}" if not np.isnan(mr['cv_mensual']) else 'N/A'
-                    cuad_m_str = str(mr['cuadrante_mensual']).upper()
-                    adi_m_val = f"{mr['adi_mensual']:.2f}"
-                    cv2_m_val = f"{(mr['cv_mensual']**2):.2f}" if not np.isnan(mr['cv_mensual']) else 'N/A'
-                    dem_m_val = f"{mr['demanda_mensual_prom']:.1f}"
-                    ss_m_val = f"{mr['ss_empirico_mensual']:.1f}"
-                    rop_m_val = f"{mr['rop_mensual']:.1f}"
-                    cajas_m_val = f"{mr['cajas_sugeridas_mensual']:,.0f}"
-                    est_m_val = mr['estado_mensual']
-                else:
-                    nom_prod, clase_abc_val, pct_v_tot, pct_v_acum = ('-', '-', '-', '-')
-                    clase_xyz_w, cv_w_val, cuad_w_str, adi_w_val, cv2_w_val, dem_w_val, ss_w_val, rop_w_val, cajas_w_val, est_w_val = ('-', '-', '-', '-', '-', '-', '-', '-', '-', '-')
-                    clase_xyz_m, cv_m_val, cuad_m_str, adi_m_val, cv2_m_val, dem_m_val, ss_m_val, rop_m_val, cajas_m_val, est_m_val = ('-', '-', '-', '-', '-', '-', '-', '-', '-', '-')
-                
-                resultados_mensuales.append({
-                    'SKU': sku_code,
-                    'Producto': nom_prod,
-                    'Clase ABC': clase_abc_val,
-                    '% Ventas Totales': pct_v_tot,
-                    'Pareto Acumulado': pct_v_acum,
-                    'Clase XYZ (Sem)': clase_xyz_w,
-                    'CV (Sem)': cv_w_val,
-                    'Cuadrante (SEM)': cuad_w_str,
-                    'ADI (Sem)': adi_w_val,
-                    'CV² (Sem)': cv2_w_val,
-                    'Demanda/Sem': dem_w_val,
-                    'SS (Sem)': ss_w_val,
-                    'ROP Sem (15 sem)': rop_w_val,
-                    'Cajas (Sem)': cajas_w_val,
-                    'Estado (Sem)': est_w_val,
-                    '|': '║',
-                    'Clase XYZ (Mes)': clase_xyz_m,
-                    'CV (Mes)': cv_m_val,
-                    'Cuadrante (MES)': cuad_m_str,
-                    'ADI (Mes)': adi_m_val,
-                    'CV² (Mes)': cv2_m_val,
-                    'Demanda/Mes': dem_m_val,
-                    'SS (Mes)': ss_m_val,
-                    'ROP Mes (3.5 m)': rop_m_val,
-                    'Cajas (Mes)': cajas_m_val,
-                    'Estado (Mes)': est_m_val,
-                })
-            
-            fig_m.update_layout(
-                height=400, margin=dict(l=20, r=20, t=30, b=30),
-                hovermode="x unified",
-                xaxis=dict(title="Mes", tickformat="%b %Y", showgrid=True, gridcolor="#EBF4EE"),
-                yaxis=dict(title="Unidades Vendidas / Mes", showgrid=True, gridcolor="#EBF4EE"),
-                plot_bgcolor="#FFFFFF", paper_bgcolor="#FFFFFF"
-            )
-            
-            st.plotly_chart(fig_m, use_container_width=True)
-            
-            # ── GRÁFICO DE REPOSICIÓN NETA MENSUAL (FCO - DEC) ──
-            if mostrar_reposicion:
-                st.markdown("#### Histórico de Reposición Neta Mensual (FCO - DEC)")
-                st.caption("Compras netas recibidas en inventario (FCO - DEC) agrupadas mensualmente.")
-                
-                fig_repo_m = go.Figure()
-                for idx, sku_code in enumerate(skus_codigos):
-                    df_repo_sku = df_plot_repo[df_plot_repo['sku'] == sku_code].copy()
-                    if not df_repo_sku.empty:
-                        s_repo_m = df_repo_sku.groupby(pd.Grouper(key='fecha', freq='MS'))['cantidad'].sum().reset_index().sort_values('fecha')
-                    else:
-                        s_repo_m = pd.DataFrame({'fecha': [], 'cantidad': []})
-                        
-                    nombre_label = df_modelo[df_modelo['sku'] == sku_code]['nombre'].values
-                    nombre_label = nombre_label[0] if len(nombre_label) > 0 else sku_code
-                    if len(nombre_label) > 30:
-                        nombre_label = nombre_label[:30] + '...'
-                    legend_name = f"{sku_code} ({nombre_label})"
-                    color_azul = paleta_azul[idx % len(paleta_azul)]
-                    
-                    fig_repo_m.add_trace(go.Scatter(
-                        x=s_repo_m['fecha'],
-                        y=s_repo_m['cantidad'],
-                        mode='lines+markers',
-                        name=legend_name,
-                        line=dict(width=2.5, color=color_azul),
-                        marker=dict(size=7, color=color_azul),
-                        hovertemplate="<b>" + sku_code + " (Reposición Neta)</b><br>Mes: %{x|%b %Y}<br>FCO - DEC: <b>%{y:,.0f} uds</b><extra></extra>"
-                    ))
-                    
-                fig_repo_m.update_layout(
-                    height=380,
-                    margin=dict(l=20, r=20, t=30, b=30),
-                    hovermode="x unified",
-                    xaxis=dict(title="Mes", tickformat="%b %Y", showgrid=True, gridcolor="#EBF4EE"),
-                    yaxis=dict(title="Unidades Repuestas (FCO - DEC) / Mes", showgrid=True, gridcolor="#EBF4EE"),
-                    legend=dict(orientation="v", yanchor="top", y=1, xanchor="left", x=1.02),
-                    plot_bgcolor="#FFFFFF",
-                    paper_bgcolor="#FFFFFF"
-                )
-                st.plotly_chart(fig_repo_m, use_container_width=True)
-            
-            # Tabla comparativa
-            st.markdown("#### Comparativa Integral de Estadísticas y Parámetros: Semanal (LT=15 sem) vs Mensual (LT=3.5 meses)")
-            st.caption("📌 **Criterios de Clasificación:**<br>"
-                       "• **% Ventas Totales y Pareto Acumulado (Por qué es ABC):** AA (acumula hasta el 50% de ingresos), A (50% a 80%), B (80% a 95%), C (último 5%).<br>"
-                       "• **CV y Clase XYZ (Por qué es X, Y o Z):** X (CV ≤ 0.50, demanda estable y predecible), Y (0.50 < CV ≤ 1.00, variabilidad intermedia), Z (CV > 1.00, demanda errática o muy dispersa).",
-                       unsafe_allow_html=True)
-            df_res_m = pd.DataFrame(resultados_mensuales)
-            df_res_m.index = np.arange(1, len(df_res_m) + 1)
-            st.dataframe(df_res_m, use_container_width=True)
 
 
 
@@ -2189,87 +2037,27 @@ with tab5:
         }).map(color_abc, subset=['clase_abc']),
         use_container_width=True
     )
-    
-    st.markdown("---")
-    st.subheader("Simulación de Análisis ABC (Agregación Mensual)")
-    st.caption("Nota matemática: La clasificación ABC se basa en el **Total de Ventas** del período. La suma de ventas es idéntica independientemente de si se suma día a día, semana a semana o mes a mes. Por tanto, el gráfico y las clasificaciones ABC no cambian al usar agregación mensual.")
-
-    fig_abc_m = make_subplots(specs=[[{"secondary_y": True}]])
-    
-    for clase in ['AA', 'A', 'B', 'C']:
-        mask_clase_m = df_abc_chart['clase_abc'] == clase
-        if mask_clase_m.any():
-            fig_abc_m.add_trace(go.Bar(
-                x=df_abc_chart[mask_clase_m]['sku'],
-                y=df_abc_chart[mask_clase_m]['total_ventas'],
-                name=f"Clase {clase} (Mensual)",
-                marker_color=color_map.get(clase),
-                hovertemplate="<b>%{x}</b><br>Clase: " + clase + "<br>Ventas Totales: $%{y:,.2f}<extra></extra>"
-            ), secondary_y=False)
-            
-    fig_abc_m.add_trace(go.Scatter(
-        x=df_abc_chart['sku'],
-        y=df_abc_chart['pct_acum'],
-        mode='lines',
-        name='% Acumulado',
-        line=dict(color='#E65100', width=3),
-        hovertemplate="<b>%{x}</b><br>% Acumulado: %{y:.1f}%<extra></extra>"
-    ), secondary_y=True)
-    
-    fig_abc_m.update_layout(
-        height=500,
-        title="Pareto ABC por Ingresos (Perspectiva Mensual - Top 100)",
-        xaxis=dict(showticklabels=False, title="Productos ordenados por Ventas (Top 100)", showgrid=False),
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-        plot_bgcolor="#FFFFFF",
-        paper_bgcolor="#FFFFFF",
-        margin=dict(l=20, r=20, t=50, b=20)
-    )
-    fig_abc_m.update_yaxes(title_text="Ventas Totales ($)", secondary_y=False, showgrid=True, gridcolor="#EBF4EE")
-    fig_abc_m.update_yaxes(title_text="% Acumulado", secondary_y=True, range=[0, 105], showgrid=False)
-    
-    st.plotly_chart(fig_abc_m, use_container_width=True)
-
-    df_abc_table_m = df_abc[['sku', 'nombre', 'total_ventas', 'pct_acum', 'clase_abc']].copy()
-    df_abc_table_m['pct_venta'] = (df_abc_table_m['total_ventas'] / df_abc_table_m['total_ventas'].sum()) * 100
-    df_abc_table_m = df_abc_table_m[['sku', 'nombre', 'total_ventas', 'pct_venta', 'pct_acum', 'clase_abc']]
-    
-    search_abc_m = st.text_input("Buscar producto por código o nombre (ABC Mensual):", key="search_abc_m").strip().lower()
-    if search_abc_m:
-        df_abc_table_m = df_abc_table_m[
-            df_abc_table_m['sku'].str.lower().str.contains(search_abc_m) | 
-            df_abc_table_m['nombre'].str.lower().str.contains(search_abc_m)
-        ]
-        
-    st.dataframe(
-        df_abc_table_m.style.format({
-            'total_ventas': '${:,.2f}',
-            'pct_venta': '{:.2f}%',
-            'pct_acum': '{:.2f}%'
-        }).map(color_abc, subset=['clase_abc']),
-        use_container_width=True
-    )
 
 # ══════════════════════════════════════════════════════════════════════════════
 # TAB 6: ANALISIS VISUAL XYZ
 # ══════════════════════════════════════════════════════════════════════════════
 with tab6:
-    st.subheader("Dispersion XYZ (Demanda vs Variabilidad)")
-    st.caption("Identificacion de productos estables (X), variables (Y) y erraticos (Z).")
+    st.subheader("Dispersión XYZ (Demanda vs Variabilidad)")
+    st.caption("Identificación de productos estables (X), variables (Y) y erráticos (Z) según su demanda y volatilidad mensual.")
     
     fig_xyz = px.scatter(
         df_modelo,
-        x='demanda_semanal_prom',
+        x='demanda_mensual_prom',
         y='cv',
         color='clase_xyz',
         color_discrete_map={'X': '#5AA06E', 'Y': '#FDD835', 'Z': '#E65100'},
         hover_name='sku',
         hover_data=['nombre', 'clase_abc'],
-        labels={'demanda_semanal_prom': 'Demanda Promedio (Semanal)', 'cv': 'Coeficiente de Variacion (CV)'}
+        labels={'demanda_mensual_prom': 'Demanda Promedio (Mensual)', 'cv': 'Coeficiente de Variación (CV Mensual)'}
     )
     
-    fig_xyz.add_hline(y=0.5, line_dash="dash", line_color="gray", annotation_text="Limite X-Y (0.5)")
-    fig_xyz.add_hline(y=1.0, line_dash="dash", line_color="gray", annotation_text="Limite Y-Z (1.0)")
+    fig_xyz.add_hline(y=0.5, line_dash="dash", line_color="gray", annotation_text="Límite X-Y (0.5)")
+    fig_xyz.add_hline(y=1.0, line_dash="dash", line_color="gray", annotation_text="Límite Y-Z (1.0)")
     
     fig_xyz.update_layout(
         height=500,
@@ -2283,13 +2071,13 @@ with tab6:
     
     st.markdown("""
     **¿Cómo funciona el Análisis XYZ?**
-    Clasifica los productos según la volatilidad y previsibilidad de su demanda usando el Coeficiente de Variación (CV).
-    * **Clase X (CV ≤ 0.5)**: Demanda estable y muy predecible. Rara vez sufren quiebres o excesos sorpresivos.
-    * **Clase Y (0.5 < CV ≤ 1.0)**: Demanda variable. Pueden tener fluctuaciones estacionales o tendencias.
-    * **Clase Z (CV > 1.0)**: Demanda muy errática e impredecible (Lumpy / Intermitente). Requieren mayor stock de seguridad relativo o políticas de pedido bajo demanda.
+    Clasifica los productos según la volatilidad y previsibilidad de su demanda mensual usando el Coeficiente de Variación ($CV_m = \\sigma_m / \\mu_m$).
+    * **Clase X (CV ≤ 0.5)**: Demanda estable y predecible. Rara vez sufren quiebres o excesos sorpresivos.
+    * **Clase Y (0.5 < CV ≤ 1.0)**: Demanda variable. Presentan fluctuaciones moderadas o estacionales.
+    * **Clase Z (CV > 1.0)**: Demanda errática o intermitente (Lumpy / Intermitente). Requieren mayor stock de seguridad o políticas bajo pedido.
     """)
     
-    df_xyz_table = df_modelo[['sku', 'nombre', 'demanda_semanal_prom', 'cv', 'clase_xyz']].copy()
+    df_xyz_table = df_modelo[['sku', 'nombre', 'demanda_mensual_prom', 'cv', 'clase_xyz']].copy()
     df_xyz_table = df_xyz_table.sort_values('cv', ascending=False).reset_index(drop=True)
     
     search_xyz = st.text_input("Buscar producto por código o nombre (XYZ):", key="search_xyz").strip().lower()
@@ -2306,48 +2094,6 @@ with tab6:
         
     st.dataframe(
         df_xyz_table.style.format({
-            'demanda_semanal_prom': '{:.1f}',
-            'cv': '{:.3f}'
-        }).map(color_xyz, subset=['clase_xyz']),
-        use_container_width=True
-    )
-
-    st.markdown("---")
-    st.subheader("Simulación XYZ (Agregación Mensual)")
-    st.caption("Identificación de volatilidad usando un Coeficiente de Variación (CV) basado en demandas **Mensuales**. Notarás que muchos SKUs migran hacia X o Y.")
-    
-    fig_xyz_m = px.scatter(
-        df_mensual_abc_xyz,
-        x='demanda_mensual_prom',
-        y='cv',
-        color='clase_xyz',
-        color_discrete_map={'X': '#5AA06E', 'Y': '#FDD835', 'Z': '#E65100'},
-        hover_name='sku',
-        hover_data=['nombre', 'clase_abc'],
-        labels={'demanda_mensual_prom': 'Demanda Promedio (Mensual)', 'cv': 'CV (Mensual)'}
-    )
-    fig_xyz_m.add_hline(y=0.5, line_dash="dash", line_color="gray", annotation_text="Limite X-Y (0.5)")
-    fig_xyz_m.add_hline(y=1.0, line_dash="dash", line_color="gray", annotation_text="Limite Y-Z (1.0)")
-    
-    fig_xyz_m.update_layout(
-        height=500, plot_bgcolor="#FFFFFF", paper_bgcolor="#FFFFFF",
-        xaxis=dict(showgrid=True, gridcolor="#EBF4EE"),
-        yaxis=dict(showgrid=True, gridcolor="#EBF4EE")
-    )
-    st.plotly_chart(fig_xyz_m, use_container_width=True)
-    
-    df_xyz_table_m = df_mensual_abc_xyz[['sku', 'nombre', 'demanda_mensual_prom', 'cv', 'clase_xyz']].copy()
-    df_xyz_table_m = df_xyz_table_m.sort_values('cv', ascending=False).reset_index(drop=True)
-    
-    search_xyz_m = st.text_input("Buscar producto por código o nombre (XYZ Mensual):", key="search_xyz_m").strip().lower()
-    if search_xyz_m:
-        df_xyz_table_m = df_xyz_table_m[
-            df_xyz_table_m['sku'].str.lower().str.contains(search_xyz_m) | 
-            df_xyz_table_m['nombre'].str.lower().str.contains(search_xyz_m)
-        ]
-        
-    st.dataframe(
-        df_xyz_table_m.style.format({
             'demanda_mensual_prom': '{:.1f}',
             'cv': '{:.3f}'
         }).map(color_xyz, subset=['clase_xyz']),
@@ -2358,60 +2104,45 @@ with tab6:
 # TAB 7: GENERADOR DE PEDIDO OPTIMO
 # ══════════════════════════════════════════════════════════════════════════════
 with tab7:
-    st.subheader("Generador Automatico de Pedido Optimo")
-    st.info("Este generador selecciona productos con demanda activa que cumplen dos condiciones de calificación estrictas: 1) Sin órdenes de compra (FCO) en los últimos 60 días (o sin compras previas registradas); 2) Stock actual crítico (≤ 30% del Punto de Reorden ROP).")
+    st.subheader("Generador Automático de Pedido Óptimo")
+    st.info("Este generador selecciona productos con demanda activa que cumplen dos condiciones de calificación estrictas: 1) Sin órdenes de compra (FCO) en los últimos 60 días (o sin compras previas registradas); 2) Stock actual crítico (≤ 30% del Punto de Reorden ROP Mensual).")
     
     # ── 1. FILTROS Y CONFIGURACIÓN DEL PEDIDO ÓPTIMO ──
     with st.container():
-        r1_col1, r1_col2 = st.columns([2.5, 1.5])
+        r1_col1, r1_col2, r1_col3 = st.columns([2.0, 1.0, 1.0])
         with r1_col1:
-            criterio_rop_opt = st.radio(
-                "Modelo de Punto de Reorden (ROP):",
-                [f"📅 ROP Semanal (LT = {lead_time} sem)", f"🗓️ ROP Mensual (LT = {round(float(lead_time) / 4, 2)} meses)"],
-                index=1,
-                horizontal=True,
-                key="radio_criterio_rop_opt"
-            )
-        with r1_col2:
             todas_cats_opt = sorted(df_modelo['categoria'].unique().tolist())
             f_cat_opt = st.multiselect(
-                "Categoria de Producto:",
+                "Categoría de Producto:",
                 options=todas_cats_opt,
                 default=[],
-                placeholder="Todas las categorias",
+                placeholder="Todas las categorías",
                 key="multiselect_cat_opt"
             )
-            
-        r2_col1, r2_col2, r2_col3 = st.columns([2.0, 1.0, 1.0])
-        with r2_col1:
-            busqueda_skus_opt = st.multiselect(
-                "Buscar producto por Codigo SKU o Descripcion (Autocompletado):",
-                options=etiquetas_catalogo,
-                placeholder="Escribe codigo o palabra para buscar...",
-                key="multiselect_busqueda_sku_opt"
-            )
-        with r2_col2:
-            f_abc_opt = st.multiselect("Clasificacion ABC:", ["AA", "A", "B", "C"], default=["AA", "A", "B", "C"], key="multiselect_abc_opt")
-        with r2_col3:
+        with r1_col2:
+            f_abc_opt = st.multiselect("Clasificación ABC:", ["AA", "A", "B", "C"], default=["AA", "A", "B", "C"], key="multiselect_abc_opt")
+        with r1_col3:
             f_xyz_opt = st.multiselect("Variabilidad XYZ:", ["X", "Y", "Z"], default=["X", "Y", "Z"], key="multiselect_xyz_opt")
-
-    usar_mensual_opt = "Mensual" in criterio_rop_opt
-    rop_eval_col = 'rop_mensual' if usar_mensual_opt else 'rop'
-    umbral_eval_col = 'umbral_rop_30_mensual' if usar_mensual_opt else 'umbral_rop_30'
-    cajas_eval_col = 'cajas_sugeridas_mensual' if usar_mensual_opt else 'cajas_sugeridas'
+            
+        busqueda_skus_opt = st.multiselect(
+            "Buscar producto por Código SKU o Descripción (Autocompletado):",
+            options=etiquetas_catalogo_reposicion,
+            placeholder="Escribe código o palabra para buscar...",
+            key="multiselect_busqueda_sku_opt"
+        )
     
-    # Exclusiones intencionales
-    skus_excluidos_intencionales = ['MASS3063', 'MASS3065', 'MASS3066', 'MASS0722']
+    # Exclusiones intencionales de reposición
+    skus_excluidos_intencionales = SKUS_IGNORAR_REPOSICION
     
     # ── FILTRADO VECTORIZADO EN 1 SOLO PASO ULTRA RÁPIDO ──
     if busqueda_skus_opt:
         codigos_opt_buscar = [s.split(" -- ")[0] for s in busqueda_skus_opt]
-        mask_opt = df_modelo['sku'].isin(codigos_opt_buscar)
+        mask_opt = df_modelo['sku'].isin(codigos_opt_buscar) & (~df_modelo['sku'].isin(skus_excluidos_intencionales))
     else:
         mask_opt = (
             ((df_modelo['dias_desde_fco'].isna()) | (df_modelo['dias_desde_fco'] > 60)) &
-            (df_modelo['stock_actual'] <= df_modelo[umbral_eval_col]) &
-            (df_modelo[rop_eval_col] > 0) &
+            (df_modelo['stock_actual'] <= df_modelo['umbral_rop_30']) &
+            (df_modelo['rop'] > 0) &
             (df_modelo['stock_transito'] == 0) &
             (df_modelo['total_unidades'] > 0) &
             (~df_modelo['sku'].isin(skus_excluidos_intencionales)) &
@@ -2435,12 +2166,11 @@ with tab7:
         'B-X': 7,  'B-Y': 8,  'B-Z': 9,
         'C-X': 10, 'C-Y': 11, 'C-Z': 12
     }
-    col_segmento_opt = 'clase_abc_xyz_mensual' if usar_mensual_opt else 'clase_abc_xyz'
-    df_optimo_filtrado['prioridad_ranking'] = df_optimo_filtrado[col_segmento_opt].map(prioridad_abc_xyz).fillna(99)
+    df_optimo_filtrado['prioridad_ranking'] = df_optimo_filtrado['clase_abc_xyz'].map(prioridad_abc_xyz).fillna(99)
     
     # Ordenamiento jerárquico: 1º Segmento ABC-XYZ, 2º Menor Stock (0, 1, 2...), 3º Mayor ROP
     df_optimo_ordenado = df_optimo_filtrado.sort_values(
-        by=['prioridad_ranking', 'stock_actual', rop_eval_col],
+        by=['prioridad_ranking', 'stock_actual', 'rop'],
         ascending=[True, True, False]
     )
     
@@ -2452,7 +2182,7 @@ with tab7:
     df_optimo_vista = df_optimo_vista.reset_index(drop=True)
     df_optimo_vista.index = np.arange(1, len(df_optimo_vista) + 1)
         
-    df_optimo_vista['pedir_cajas'] = np.maximum(1, pd.to_numeric(df_optimo_vista[cajas_eval_col], errors='coerce').fillna(1).astype(int))
+    df_optimo_vista['pedir_cajas'] = np.maximum(1, pd.to_numeric(df_optimo_vista['cajas_sugeridas'], errors='coerce').fillna(1).astype(int))
     
     if skus_subidos_gsheet_opt:
         col_inf_opt, col_rst_opt = st.columns([3.5, 1.5])
@@ -2485,14 +2215,12 @@ with tab7:
 
         # ── 4. TABLA INTERACTIVA (DATA EDITOR) ──
         cols_editor_opt = [
-            'incluir_en_pedido', 'imagen_url', 'sku', 'nombre', 'categoria', 'clase_abc_xyz',
-            'estado_fco', 'stock_actual', 'stock_transito', 'demanda_semanal_prom', 'demanda_mensual_prom',
-            'media_movil_4sem', 'tendencia', 'rop', 'rop_mensual', umbral_eval_col, 'pedir_cajas',
-            'cantidad_por_caja', 'CBMM', 'costo', 'costo_puesto'
+            'incluir_en_pedido', 'imagen_url', 'sku', 'nombre', 'clase_abc_xyz',
+            'estado_fco', 'stock_actual', 'stock_transito', 'demanda_mensual_prom',
+            'tendencia', 'rop'
         ]
         
-        rop_label_sem = f"ROP Sem ({lead_time}s)"
-        rop_label_mes = "ROP Mes (3.5m)"
+        rop_label_mes = f"ROP ({lt_m_equiv}m)"
         
         v_editor_t7 = st.session_state.get('v_editor_t7', 0)
         df_optimo_editado = st.data_editor(
@@ -2502,28 +2230,18 @@ with tab7:
                 "imagen_url": st.column_config.ImageColumn("Foto", help="Foto oficial del producto"),
                 "sku": st.column_config.TextColumn("Código SKU", width="small"),
                 "nombre": st.column_config.TextColumn("Nombre del Producto", width="large"),
-                "categoria": st.column_config.TextColumn("Categoría", width="medium"),
                 "clase_abc_xyz": st.column_config.TextColumn("Segmento", width="small"),
                 "estado_fco": st.column_config.TextColumn("Última Compra", width="medium", help="Fecha o días transcurridos desde la última FCO"),
-                "pedir_cajas": st.column_config.NumberColumn("Cajas Sugeridas", min_value=0, step=1, help="Editable: Cajas a ordenar"),
-                "stock_actual": st.column_config.NumberColumn("Stock", format="%.0f"),
-                "stock_transito": st.column_config.NumberColumn("En Tránsito", format="%.0f"),
-                "demanda_semanal_prom": st.column_config.NumberColumn("Demanda/Sem", format="%.1f"),
+                "stock_actual": st.column_config.NumberColumn("Stock Actual", format="%.0f"),
+                "stock_transito": st.column_config.NumberColumn("Stock en Tránsito", format="%.0f"),
                 "demanda_mensual_prom": st.column_config.NumberColumn("Demanda/Mes", format="%.1f"),
-                "media_movil_4sem": st.column_config.NumberColumn("Media Móvil (4s)", format="%.1f", help="Promedio de unidades vendidas en las últimas 4 semanas"),
                 "tendencia": st.column_config.TextColumn("Tendencia (4s)", help="Variación porcentual reciente (últimas 4 sem vs 4 sem previas)"),
-                "rop": st.column_config.NumberColumn(rop_label_sem, format="%.1f"),
-                "rop_mensual": st.column_config.NumberColumn(rop_label_mes, format="%.1f"),
-                umbral_eval_col: st.column_config.NumberColumn("Umbral (30% ROP)", format="%.1f"),
-                "CBMM": st.column_config.NumberColumn("CBM/Caja", format="%.3f"),
-                "costo": st.column_config.NumberColumn("Costo FOB ($)", format="$%.2f"),
-                "costo_puesto": st.column_config.NumberColumn("Costo DDP ($)", format="$%.2f", help="Costo FOB + Flete unitario estimado"),
+                "rop": st.column_config.NumberColumn(rop_label_mes, format="%.1f", help="Punto de Reorden unificado mensual"),
             },
             disabled=[
-                'imagen_url', 'sku', 'nombre', 'categoria', 'clase_abc_xyz', 'estado_fco',
-                'stock_actual', 'stock_transito', 'demanda_semanal_prom', 'demanda_mensual_prom',
-                'media_movil_4sem', 'tendencia', 'rop', 'rop_mensual', umbral_eval_col,
-                'cantidad_por_caja', 'CBMM', 'costo', 'costo_puesto'
+                'imagen_url', 'sku', 'nombre', 'clase_abc_xyz', 'estado_fco',
+                'stock_actual', 'stock_transito', 'demanda_mensual_prom',
+                'tendencia', 'rop'
             ],
             use_container_width=True,
             height=420,
@@ -2532,8 +2250,10 @@ with tab7:
         
         # ── 5. CÁLCULO DE CONTENEDOR EN TIEMPO REAL PARA SELECCIONADOS ──
         # Si el usuario lo marcó con el checkbox, incluirlo SIEMPRE (con al menos 1 caja si estaba en 0)
-        seleccionados_opt = df_optimo_editado[df_optimo_editado['incluir_en_pedido']].copy()
-        seleccionados_opt['pedir_cajas'] = np.maximum(1, pd.to_numeric(seleccionados_opt['pedir_cajas'], errors='coerce').fillna(1).astype(int))
+        idx_sel_opt = df_optimo_editado[df_optimo_editado['incluir_en_pedido']].index
+        seleccionados_opt = df_optimo_vista.loc[idx_sel_opt].copy()
+        seleccionados_opt['incluir_en_pedido'] = True
+        seleccionados_opt['pedir_cajas'] = np.maximum(1, pd.to_numeric(seleccionados_opt.get('pedir_cajas', 1), errors='coerce').fillna(1).astype(int))
         seleccionados_opt['cbm_total'] = seleccionados_opt['pedir_cajas'] * seleccionados_opt['CBMM']
         seleccionados_opt['unidades_total'] = seleccionados_opt['pedir_cajas'] * seleccionados_opt['cantidad_por_caja']
         seleccionados_opt['inversion_fob'] = seleccionados_opt['unidades_total'] * seleccionados_opt['costo']
@@ -2548,47 +2268,6 @@ with tab7:
         contenedores_totales_opt = cbm_opt_acum / capacidad_cont if capacidad_cont > 0 else 0
         
         st.markdown("<br>", unsafe_allow_html=True)
-        m1, m2, m3, m4 = st.columns(4)
-        with m1:
-            st.markdown(f"""
-            <div class="metric-box">
-                <div class="metric-label">Volumen Total CBM</div>
-                <div class="metric-value">{cbm_opt_acum:,.2f} m³</div>
-            </div>
-            """, unsafe_allow_html=True)
-        with m2:
-            st.markdown(f"""
-            <div class="metric-box">
-                <div class="metric-label">Inversión FOB / DDP</div>
-                <div class="metric-value">${fob_opt_acum:,.2f}</div>
-                <div class="metric-delta">DDP Est.: ${ddp_opt_acum:,.2f}</div>
-            </div>
-            """, unsafe_allow_html=True)
-        with m3:
-            st.markdown(f"""
-            <div class="metric-box">
-                <div class="metric-label">Empaque Total</div>
-                <div class="metric-value">{cajas_opt_acum:,} cajas</div>
-                <div class="metric-delta">{uds_opt_acum:,} unidades ({len(seleccionados_opt)} SKUs)</div>
-            </div>
-            """, unsafe_allow_html=True)
-        with m4:
-            st.markdown(f"""
-            <div class="metric-box">
-                <div class="metric-label">Ocupación de Contenedor</div>
-                <div class="metric-value">{contenedores_totales_opt:.2f} cont.</div>
-                <div class="metric-delta">{pct_llenado_opt:.1f}% del 1er contenedor</div>
-            </div>
-            """, unsafe_allow_html=True)
-            
-        st.markdown("<br>", unsafe_allow_html=True)
-        st.progress(pct_llenado_opt / 100.0)
-        
-        if cbm_opt_acum > capacidad_cont:
-            st.warning(f"El volumen de productos seleccionados supera la capacidad de 1 contenedor ({capacidad_cont} CBM). Se requieren **{math.ceil(contenedores_totales_opt)} contenedores**.")
-        elif pct_llenado_opt >= 90:
-            st.success(f"Contenedor optimizado. Nivel de ocupación: **{pct_llenado_opt:.1f}%**.")
-            
         # ── 6. BOTONES DE DESCARGA Y ENVÍO A GOOGLE SHEETS ──
         col_d1, col_d2 = st.columns([1, 1])
         with col_d1:
@@ -2722,23 +2401,22 @@ with tab8:
     
     # ── 5. TABLA DE DETALLE ──
     if not df_sobre_stock_filtrado.empty:
-        df_show_t8 = df_sobre_stock_filtrado[['sku', 'nombre', 'categoria', 'stock_actual', 'stock_transito', 'ventas_6m', 'costo', 'valor_inventario_fob', 'cbm_ocupado']].copy()
+        df_show_t8 = df_sobre_stock_filtrado[['sku', 'nombre', 'stock_actual', 'stock_transito', 'ventas_6m', 'valor_inventario_fob', 'cbm_ocupado']].copy()
         
         # Ordenar por valor de inventario descendente
         df_show_t8 = df_show_t8.sort_values('valor_inventario_fob', ascending=False)
         
         # Renombrar columnas para visualización clara
         df_show_t8.columns = [
-            'Código SKU', 'Descripción', 'Categoría', 'Stock Actual', 'En Tránsito', 
-            'Ventas (6 Meses)', 'Costo FOB (Unit)', 'Valor Inventario ($)', 'Volumen Ocupado (m³)'
+            'Código SKU', 'Descripción', 'Stock Actual', 'Stock en Tránsito', 
+            'Ventas (6 Meses)', 'Valor Inventario ($)', 'Volumen Ocupado (m³)'
         ]
         
         st.dataframe(
             df_show_t8.style.format({
                 'Stock Actual': '{:,.0f}',
-                'En Tránsito': '{:,.0f}',
+                'Stock en Tránsito': '{:,.0f}',
                 'Ventas (6 Meses)': '{:,.0f}',
-                'Costo FOB (Unit)': '${:,.2f}',
                 'Valor Inventario ($)': '${:,.2f}',
                 'Volumen Ocupado (m³)': '{:,.3f}'
             }),
