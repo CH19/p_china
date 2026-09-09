@@ -620,7 +620,7 @@ def cargar_datos_base(mtime_ventas=None, mtime_tranz=None, mtime_art=0.0, mtime_
             df_clean['total_costo'] = pd.to_numeric(df_clean['total_costo'].astype(str).str.replace(',', '', regex=False), errors='coerce').fillna(0.0)
             df_clean['costo_unit_trans'] = pd.to_numeric(df_clean['costo_unit_trans'].astype(str).str.replace(',', '', regex=False), errors='coerce').fillna(0.0)
             df_clean['fecha'] = pd.to_datetime(df_clean['fecha'], format='mixed', dayfirst=True)
-            df_clean = df_clean[df_clean['sku'] != 'MASS1575']
+            df_clean = df_clean[~df_clean['sku'].isin(['MASS1575', 'MASS1350', 'MASS0721'])]
     else:
         # Fallback a reportes individuales solo si no hay ningún archivo de ventas
         reports = [i + 4 for i in range(12)]
@@ -895,11 +895,12 @@ mtime_img = os.path.getmtime(p_img) if os.path.exists(p_img) else 0.0
 
 df_trans, df_art, df_metadata, df_info_prod, df_stock_transito, df_p2p, df_fco_ult, df_reposicion = cargar_datos_base(mtime_ventas, mtime_tranz, mtime_art, mtime_cons, mtime_img)
 
-# Excluir de forma global y permanente el SKU MASS1350 de todo el sistema
-df_trans = df_trans[df_trans['sku'] != 'MASS1350']
-df_art = df_art[df_art['sku'] != 'MASS1350']
+# Excluir de forma global y permanente los SKUs de servicios o bloqueados de todo el sistema
+skus_excluidos_global = ['MASS1350', 'MASS0721']
+df_trans = df_trans[~df_trans['sku'].isin(skus_excluidos_global)]
+df_art = df_art[~df_art['sku'].isin(skus_excluidos_global)]
 if not df_reposicion.empty:
-    df_reposicion = df_reposicion[df_reposicion['sku'] != 'MASS1350']
+    df_reposicion = df_reposicion[~df_reposicion['sku'].isin(skus_excluidos_global)]
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 3. SIDEBAR CORPORATIVO MASSHOPPING
@@ -913,6 +914,9 @@ with st.sidebar:
     
     if st.button("🔄 Recargar Base de Datos (Limpiar Caché)", use_container_width=True, help="Fuerza la recarga de transacciones y data/articulos.xlsx"):
         st.cache_data.clear()
+        for k in ['rango_grafico_tab3', 'sidebar_rango_custom']:
+            if k in st.session_state:
+                del st.session_state[k]
         st.rerun()
         
     st.divider()
@@ -926,6 +930,9 @@ with st.sidebar:
     
     fecha_max = df_trans['fecha'].max()
     fecha_min = df_trans['fecha'].min()
+    if pd.notnull(fecha_min) and pd.notnull(fecha_max):
+        st.caption(f"🗓️ Ventas registradas: **{fecha_min.strftime('%d/%m/%Y')}** al **{fecha_max.strftime('%d/%m/%Y')}**")
+
     if "Año" in opcion_tiempo:
         fecha_corte = fecha_max - pd.DateOffset(years=1)
         df_trans_filtrada = df_trans[df_trans['fecha'] >= fecha_corte].copy()
@@ -938,6 +945,11 @@ with st.sidebar:
     elif "Personalizado" in opcion_tiempo:
         d_min = fecha_min.date() if pd.notnull(fecha_min) else datetime.date(2024, 1, 1)
         d_max = fecha_max.date() if pd.notnull(fecha_max) else datetime.date.today()
+        if 'sidebar_rango_custom' in st.session_state:
+            val_rc = st.session_state['sidebar_rango_custom']
+            if isinstance(val_rc, (tuple, list)) and len(val_rc) == 2:
+                if val_rc[1] < d_max:
+                    st.session_state['sidebar_rango_custom'] = (val_rc[0], d_max)
         rango_custom = st.date_input(
             "Rango de Fechas:",
             value=(d_min, d_max),
@@ -970,17 +982,7 @@ with st.sidebar:
         help="Tiempo en semanas que tarda el proveedor en entregar el pedido. Modifica dinámicamente la Demanda Esperada en Lead Time y el ROP.",
         key="sidebar_lead_time"
     )
-    
-    factor_ss_pct = st.slider(
-        "Margen de Stock de Seguridad (% adicional):",
-        min_value=0,
-        max_value=100,
-        value=20,
-        step=5,
-        help="Colchón adicional sobre el Stock de Seguridad estándar (Z * σ_m * √LT_m). Por defecto en 20% para asegurar cobertura estocástica ante variaciones de demanda.",
-        key="sidebar_factor_ss"
-    )
-    factor_ss = factor_ss_pct / 100.0
+    factor_ss = 0.0
     
     lt_m_equiv = 3.5 if lead_time == 15 else round(lead_time / (52.0 / 12.0), 1)
     st.caption(f"🗓️ *Lead Time equivalente modelo mensual: **{lt_m_equiv} meses**.*")
@@ -989,8 +991,8 @@ with st.sidebar:
     st.subheader("Parámetros del Contenedor")
     capacidad_cont = st.number_input("Capacidad Contenedor 40HQ (CBM):", value=68.0, step=1.0, key="sidebar_cap_cont")
     flete_cbm = st.number_input("Flete por CBM (USD):", value=500.0, step=5.0, key="sidebar_flete")
-    costo_orden = st.number_input("Costo Administrativo Orden (USD):", value=50.0, step=5.0, key="sidebar_costo_orden")
-    tasa_mant = st.slider("Tasa Mantenimiento Inv. (% anual):", min_value=0.05, max_value=0.40, value=0.15, step=0.01, key="sidebar_tasa_mant")
+    costo_orden = 50.0
+    tasa_mant = 0.15
     
     st.divider()
     st.caption("Masshopping Supply Chain Portal v3.0")
@@ -1001,7 +1003,7 @@ with st.sidebar:
 # SKUs excluidos/ignorados completamente para la reposición (no reordenar, 0 cajas sugeridas)
 SKUS_IGNORAR_REPOSICION = set(
     [f"MASS{i:04d}" for i in range(3000, 3062)] +
-    ['MASS3063', 'MASS3065', 'MASS3066', 'MASS0722']
+    ['MASS3063', 'MASS3065', 'MASS3066', 'MASS0721', 'MASS0722']
 )
 
 @st.cache_data
@@ -1374,12 +1376,12 @@ st.markdown("""
 # 6. PESTANAS PRINCIPALES
 # ══════════════════════════════════════════════════════════════════════════════
 tab1, tab7, tab3, tab5, tab6, tab2, tab8 = st.tabs([
-    "Armado y Simulacion de Contenedor",
+    "Simulador de Contenedor",
     "Generador de Pedido Optimo",
-    "Ficha Visual y Comparador",
-    "Analisis Visual ABC",
-    "Analisis Visual XYZ",
-    "Matriz Estrategica ABC-XYZ",
+    "Buscar Producto",
+    "Analisis ABC",
+    "Analisis XYZ",
+    "Matriz ABC-XYZ",
     "Sobre Stock y Stock Muerto"
 ])
 
@@ -1664,12 +1666,20 @@ with tab3:
         # 2. Grafico Comparativo con TENDENCIA e IMPACTO CAMBIARIO (P2P)
         st.markdown("<br>", unsafe_allow_html=True)
         st.subheader("Comparativa Histórica de Demanda vs Variación Cambiaria")
-        st.caption("Gráfico analítico de evolución temporal con línea de tendencia ajustada e impacto cambiario interdiario.")
         
         # Local Date Range Filter for the Chart
         fecha_min_global = df_trans['fecha'].min().date() if not df_trans.empty else datetime.date(2023,1,1)
         fecha_max_global = df_trans['fecha'].max().date() if not df_trans.empty else datetime.date(2026,12,31)
+        
+        st.caption(f"Gráfico analítico de cantidades vendidas con impacto cambiario interdiario. Datos cargados hasta: **{fecha_max_global.strftime('%d/%m/%Y')}** ({len(df_trans):,} transacciones de venta).")
                 
+        # Sincronizar automáticamente el rango del gráfico si la base de datos se actualizó con fechas más recientes
+        if 'rango_grafico_tab3' in st.session_state:
+            curr_rango = st.session_state['rango_grafico_tab3']
+            if isinstance(curr_rango, (tuple, list)) and len(curr_rango) == 2:
+                if curr_rango[1] < fecha_max_global:
+                    st.session_state['rango_grafico_tab3'] = (curr_rango[0], fecha_max_global)
+
         col_freq, col_rango = st.columns([1.5, 2.5])
         with col_freq:
             freq_grafico = st.radio(
@@ -1683,6 +1693,8 @@ with tab3:
             rango_local = st.date_input(
                 "Rango de Fechas Específicas (Gráfico):",
                 value=(fecha_min_global, fecha_max_global),
+                min_value=fecha_min_global,
+                max_value=fecha_max_global,
                 key="rango_grafico_tab3"
             )
             
@@ -1870,17 +1882,10 @@ with tab3:
         df_plot_skus = df_plot_trans[df_plot_trans['sku'].isin(skus_codigos)]
         if not df_plot_skus.empty:
             total_unidades = df_plot_skus['cantidad'].sum()
-            df_plot_usd = pd.merge(df_plot_skus, df_modelo[['sku', 'costo']], on='sku', how='left')
-            df_plot_usd['costo'] = df_plot_usd['costo'].fillna(0)
-            total_usd = (df_plot_usd['cantidad'] * df_plot_usd['costo']).sum()
             
             st.markdown("---")
             st.markdown("### Totales Agregados del Período Seleccionado")
-            t_col1, t_col2 = st.columns(2)
-            with t_col1:
-                st.metric("Total Unidades Vendidas", f"{total_unidades:,.0f}")
-            with t_col2:
-                st.metric("Total Costo (FOB)", f"${total_usd:,.2f}")
+            st.metric("Total Unidades Vendidas", f"{total_unidades:,.0f}")
         else:
             st.info("No hay datos de venta en el rango seleccionado para los productos elegidos.")
 
@@ -1931,15 +1936,7 @@ with tab3:
             df_plot_repo_skus = df_plot_repo[df_plot_repo['sku'].isin(skus_codigos)]
             if not df_plot_repo_skus.empty:
                 total_repo_uds = df_plot_repo_skus['cantidad'].sum()
-                df_plot_repo_usd = pd.merge(df_plot_repo_skus, df_modelo[['sku', 'costo']], on='sku', how='left')
-                df_plot_repo_usd['costo'] = df_plot_repo_usd['costo'].fillna(0)
-                total_repo_fob = (df_plot_repo_usd['cantidad'] * df_plot_repo_usd['costo']).sum()
-                
-                r_col1, r_col2 = st.columns(2)
-                with r_col1:
-                    st.metric("Total Unidades Repuestas (FCO - DEC)", f"{total_repo_uds:,.0f}")
-                with r_col2:
-                    st.metric("Inversión Repuesta Estimada (FOB)", f"${total_repo_fob:,.2f}")
+                st.metric("Total Unidades Repuestas (FCO - DEC)", f"{total_repo_uds:,.0f}")
 
 
 
