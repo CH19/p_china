@@ -1067,6 +1067,7 @@ def ejecutar_motor(df_t, _df_a, _df_m, _df_info, _df_transit, _df_fco, lt, flete
                 'demanda_mensual_prom': 0.0, 'demanda_mensual_std': 0.0,
                 'demanda_semanal_prom': 0.0, 'demanda_semanal_std': 0.0,
                 'media_movil_4sem': 0.0, 'tendencia': 'Sin Datos',
+                'ventas_ult_3m': 0.0, 'ventas_prev_3m': np.nan, 'diff_trimestral': np.nan,
                 'mu_sba': 0.0, 'demanda_esperada_lt': 0.0, 'ss_empirico': 0.0, 'rop': 0.0
             }
         else:
@@ -1145,9 +1146,12 @@ def ejecutar_motor(df_t, _df_a, _df_m, _df_info, _df_transit, _df_fco, lt, flete
             media_movil_4sem = mu_3m / SEMANAS_POR_MES
             
             # Tendencia mensual robusta
+            ventas_ult_3m = float(round(mu_3m, 1))
             if len(ts_win_m) >= 6:
-                prev_3m = ts_win_m[-6:-3].mean()
-                diff_abs = mu_3m - prev_3m
+                prev_3m = float(ts_win_m[-6:-3].mean())
+                diff_abs = float(mu_3m - prev_3m)
+                ventas_prev_3m = float(round(prev_3m, 1))
+                diff_trimestral = float(round(diff_abs, 1))
                 if prev_3m == 0 and mu_3m == 0:
                     tendencia_txt = "⏸️ Sin ventas"
                 elif prev_3m > 0 and mu_3m == 0:
@@ -1165,8 +1169,12 @@ def ejecutar_motor(df_t, _df_a, _df_m, _df_info, _df_transit, _df_fco, lt, flete
                     else:
                         tendencia_txt = "➡️ Estable"
             elif len(ts_win_m) >= 3:
+                ventas_prev_3m = np.nan
+                diff_trimestral = np.nan
                 tendencia_txt = f"🆕 Reciente ({mu_3m:.1f} uds/m)" if mu_3m > 0 else "🆕 Reciente (Sin ventas)"
             else:
+                ventas_prev_3m = np.nan
+                diff_trimestral = np.nan
                 tendencia_txt = "🆕 Nuevo (<3 meses)"
                 
             res_sku = {
@@ -1183,6 +1191,9 @@ def ejecutar_motor(df_t, _df_a, _df_m, _df_info, _df_transit, _df_fco, lt, flete
                 'demanda_semanal_std': demanda_semanal_std,
                 'media_movil_4sem': float(round(media_movil_4sem, 1)),
                 'tendencia': tendencia_txt,
+                'ventas_ult_3m': ventas_ult_3m,
+                'ventas_prev_3m': ventas_prev_3m,
+                'diff_trimestral': diff_trimestral,
                 'mu_sba': mu_sba_m,
                 'demanda_esperada_lt': dem_lt_m,
                 'ss_empirico': ss_emp_m,
@@ -2217,7 +2228,7 @@ with tab7:
         cols_editor_opt = [
             'incluir_en_pedido', 'imagen_url', 'sku', 'nombre', 'clase_abc_xyz',
             'estado_fco', 'stock_actual', 'stock_transito', 'demanda_mensual_prom',
-            'tendencia', 'rop'
+            'rop'
         ]
         
         rop_label_mes = f"ROP ({lt_m_equiv}m)"
@@ -2235,13 +2246,12 @@ with tab7:
                 "stock_actual": st.column_config.NumberColumn("Stock Actual", format="%.0f"),
                 "stock_transito": st.column_config.NumberColumn("Stock en Tránsito", format="%.0f"),
                 "demanda_mensual_prom": st.column_config.NumberColumn("Demanda/Mes", format="%.1f"),
-                "tendencia": st.column_config.TextColumn("Tendencia (4s)", help="Variación porcentual reciente (últimas 4 sem vs 4 sem previas)"),
                 "rop": st.column_config.NumberColumn(rop_label_mes, format="%.1f", help="Punto de Reorden unificado mensual"),
             },
             disabled=[
                 'imagen_url', 'sku', 'nombre', 'clase_abc_xyz', 'estado_fco',
                 'stock_actual', 'stock_transito', 'demanda_mensual_prom',
-                'tendencia', 'rop'
+                'rop'
             ],
             use_container_width=True,
             height=420,
