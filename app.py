@@ -1458,7 +1458,7 @@ with tab1:
         
     # Tabla editable
     cols_editor = [
-        'incluir_en_pedido', 'imagen_url', 'sku', 'nombre', 'clase_abc_xyz',
+        'incluir_en_pedido', 'pedir_cajas', 'imagen_url', 'sku', 'nombre', 'clase_abc_xyz',
         'estado_fco', 'stock_actual', 'stock_transito', 'rop', 'demanda_mensual_prom'
     ]
     
@@ -1467,6 +1467,7 @@ with tab1:
         df_vista[cols_editor],
         column_config={
             "incluir_en_pedido": st.column_config.CheckboxColumn("Incluir", help="Marcar para sumar al contenedor"),
+            "pedir_cajas": st.column_config.NumberColumn("Cajas", min_value=0, step=1, help="Número de cajas a pedir"),
             "imagen_url": st.column_config.ImageColumn("Foto", help="Foto oficial del producto Masshopping"),
             "sku": st.column_config.TextColumn("Codigo SKU", width="small"),
             "nombre": st.column_config.TextColumn("Nombre del Producto", width="large"),
@@ -1483,11 +1484,14 @@ with tab1:
         key=f"editor_masshopping_cont_{v_editor_t1}"
     )
     
-    # Calculos en tiempo real para seleccionados (mínimo 1 caja si está marcado)
+    # Calculos en tiempo real para seleccionados
     idx_sel = df_editado[df_editado['incluir_en_pedido']].index
     seleccionados = df_vista.loc[idx_sel].copy()
     seleccionados['incluir_en_pedido'] = True
-    seleccionados['pedir_cajas'] = np.maximum(0, pd.to_numeric(df_editado.loc[idx_sel, 'pedir_cajas'], errors='coerce').fillna(0).astype(int))
+    if 'pedir_cajas' in df_editado.columns:
+        seleccionados['pedir_cajas'] = np.maximum(0, pd.to_numeric(df_editado.loc[idx_sel, 'pedir_cajas'], errors='coerce').fillna(0).astype(int))
+    else:
+        seleccionados['pedir_cajas'] = np.maximum(0, pd.to_numeric(seleccionados.get('pedir_cajas', 0), errors='coerce').fillna(0).astype(int))
     seleccionados['cbm_total'] = seleccionados['pedir_cajas'] * seleccionados['CBMM']
     seleccionados['unidades_total'] = seleccionados['pedir_cajas'] * seleccionados['cantidad_por_caja']
     seleccionados['inversion_fob'] = seleccionados['unidades_total'] * seleccionados['costo']
@@ -2256,7 +2260,7 @@ with tab7:
 
         # ── 4. TABLA INTERACTIVA (DATA EDITOR) ──
         cols_editor_opt = [
-            'incluir_en_pedido', 'imagen_url', 'sku', 'nombre', 'clase_abc_xyz',
+            'incluir_en_pedido', 'pedir_cajas', 'imagen_url', 'sku', 'nombre', 'clase_abc_xyz',
             'estado_fco', 'stock_actual', 'stock_transito', 'demanda_mensual_prom',
             'rop'
         ]
@@ -2268,6 +2272,7 @@ with tab7:
             df_optimo_vista[cols_editor_opt],
             column_config={
                 "incluir_en_pedido": st.column_config.CheckboxColumn("Incluir", help="Marcar para sumar al contenedor"),
+                "pedir_cajas": st.column_config.NumberColumn("Cajas", min_value=0, step=1, help="Número de cajas a pedir"),
                 "imagen_url": st.column_config.ImageColumn("Foto", help="Foto oficial del producto"),
                 "sku": st.column_config.TextColumn("Código SKU", width="small"),
                 "nombre": st.column_config.TextColumn("Nombre del Producto", width="large"),
@@ -2289,11 +2294,13 @@ with tab7:
         )
         
         # ── 5. CÁLCULO DE CONTENEDOR EN TIEMPO REAL PARA SELECCIONADOS ──
-        # Si el usuario lo marcó con el checkbox, incluirlo SIEMPRE (con al menos 1 caja si estaba en 0)
         idx_sel_opt = df_optimo_editado[df_optimo_editado['incluir_en_pedido']].index
         seleccionados_opt = df_optimo_vista.loc[idx_sel_opt].copy()
         seleccionados_opt['incluir_en_pedido'] = True
-        seleccionados_opt['pedir_cajas'] = np.maximum(0, pd.to_numeric(df_optimo_editado.loc[idx_sel_opt, 'pedir_cajas'], errors='coerce').fillna(0).astype(int))
+        if 'pedir_cajas' in df_optimo_editado.columns:
+            seleccionados_opt['pedir_cajas'] = np.maximum(0, pd.to_numeric(df_optimo_editado.loc[idx_sel_opt, 'pedir_cajas'], errors='coerce').fillna(0).astype(int))
+        else:
+            seleccionados_opt['pedir_cajas'] = np.maximum(0, pd.to_numeric(seleccionados_opt.get('pedir_cajas', 0), errors='coerce').fillna(0).astype(int))
         seleccionados_opt['cbm_total'] = seleccionados_opt['pedir_cajas'] * seleccionados_opt['CBMM']
         seleccionados_opt['unidades_total'] = seleccionados_opt['pedir_cajas'] * seleccionados_opt['cantidad_por_caja']
         seleccionados_opt['inversion_fob'] = seleccionados_opt['unidades_total'] * seleccionados_opt['costo']
@@ -2308,6 +2315,8 @@ with tab7:
         contenedores_totales_opt = cbm_opt_acum / capacidad_cont if capacidad_cont > 0 else 0
         
         st.markdown("<br>", unsafe_allow_html=True)
+        if 'gsheet_success_msg' in st.session_state:
+            st.success(st.session_state.pop('gsheet_success_msg'))
         # ── 6. BOTONES DE DESCARGA Y ENVÍO A GOOGLE SHEETS ──
         col_d1, col_d2 = st.columns([1, 1])
         with col_d1:
