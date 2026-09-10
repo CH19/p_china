@@ -297,8 +297,8 @@ def construir_df_intermedio_gsheet(df_sel, flete_cbm_val=500.0, df_catalogo=None
     total_uds = cajas * uds_caja
     costo_fob = get_series_num(df_work, 'costo', 0.0)
     
-    # 4. CANTIDAD (Total Uds)
-    df_out['CANTIDAD'] = total_uds
+    # 4. CANTIDAD (Total Uds, o vacio si es 0)
+    df_out['CANTIDAD'] = np.where(total_uds > 0, total_uds, '')
     
     # 5. COSTO (FOB Unit)
     df_out['COSTO'] = np.where(costo_fob > 0, costo_fob.round(2), '')
@@ -306,8 +306,8 @@ def construir_df_intermedio_gsheet(df_sel, flete_cbm_val=500.0, df_catalogo=None
     # 6. CANTIDAD POR CAJA
     df_out['CANTIDAD POR CAJA'] = uds_caja
     
-    # 7. CANTIDAD DE CAJAS
-    df_out['CANTIDAD DE CAJAS'] = cajas
+    # 7. CANTIDAD DE CAJAS (o vacio si es 0)
+    df_out['CANTIDAD DE CAJAS'] = np.where(cajas > 0, cajas, '')
     
     # Dimensiones
     cm_a = get_series_num(df_work, 'cm_a', 0.0)
@@ -1327,14 +1327,10 @@ def ejecutar_motor(df_t, _df_a, _df_m, _df_info, _df_transit, _df_fco, lt, flete
     df_calc['requiere_pedido_mensual'] = df_calc['requiere_pedido']
     df_calc['estado_mensual'] = df_calc['estado']
     
-    cajas_sug = np.where(
-        df_calc['requiere_pedido'],
-        np.maximum(1, np.ceil(eoq / df_calc['cantidad_por_caja']).astype(int)),
-        0
-    )
-    df_calc['cajas_sugeridas'] = cajas_sug
-    df_calc['cajas_sugeridas_mensual'] = cajas_sug
-    df_calc['pedir_cajas'] = df_calc['cajas_sugeridas']
+    cajas_sug = 0
+    df_calc['cajas_sugeridas'] = 0
+    df_calc['cajas_sugeridas_mensual'] = 0
+    df_calc['pedir_cajas'] = 0
     df_calc['incluir_en_pedido'] = False
     
     return df_calc
@@ -1491,7 +1487,7 @@ with tab1:
     idx_sel = df_editado[df_editado['incluir_en_pedido']].index
     seleccionados = df_vista.loc[idx_sel].copy()
     seleccionados['incluir_en_pedido'] = True
-    seleccionados['pedir_cajas'] = np.maximum(1, pd.to_numeric(seleccionados.get('pedir_cajas', 1), errors='coerce').fillna(1).astype(int))
+    seleccionados['pedir_cajas'] = np.maximum(0, pd.to_numeric(df_editado.loc[idx_sel, 'pedir_cajas'], errors='coerce').fillna(0).astype(int))
     seleccionados['cbm_total'] = seleccionados['pedir_cajas'] * seleccionados['CBMM']
     seleccionados['unidades_total'] = seleccionados['pedir_cajas'] * seleccionados['cantidad_por_caja']
     seleccionados['inversion_fob'] = seleccionados['unidades_total'] * seleccionados['costo']
@@ -2227,7 +2223,7 @@ with tab7:
     df_optimo_vista = df_optimo_vista.reset_index(drop=True)
     df_optimo_vista.index = np.arange(1, len(df_optimo_vista) + 1)
         
-    df_optimo_vista['pedir_cajas'] = np.maximum(1, pd.to_numeric(df_optimo_vista['cajas_sugeridas'], errors='coerce').fillna(1).astype(int))
+    df_optimo_vista['pedir_cajas'] = 0
     
     if skus_subidos_gsheet_opt:
         col_inf_opt, col_rst_opt = st.columns([3.5, 1.5])
@@ -2297,7 +2293,7 @@ with tab7:
         idx_sel_opt = df_optimo_editado[df_optimo_editado['incluir_en_pedido']].index
         seleccionados_opt = df_optimo_vista.loc[idx_sel_opt].copy()
         seleccionados_opt['incluir_en_pedido'] = True
-        seleccionados_opt['pedir_cajas'] = np.maximum(1, pd.to_numeric(seleccionados_opt.get('pedir_cajas', 1), errors='coerce').fillna(1).astype(int))
+        seleccionados_opt['pedir_cajas'] = np.maximum(0, pd.to_numeric(df_optimo_editado.loc[idx_sel_opt, 'pedir_cajas'], errors='coerce').fillna(0).astype(int))
         seleccionados_opt['cbm_total'] = seleccionados_opt['pedir_cajas'] * seleccionados_opt['CBMM']
         seleccionados_opt['unidades_total'] = seleccionados_opt['pedir_cajas'] * seleccionados_opt['cantidad_por_caja']
         seleccionados_opt['inversion_fob'] = seleccionados_opt['unidades_total'] * seleccionados_opt['costo']
