@@ -518,22 +518,24 @@ def obtener_ruta_data(nombre_archivo):
     return nombre_archivo
 
 def obtener_rutas_ventas():
-    """Encuentra ventas.csv y cualquier ventas_i.csv ordenados numéricamente."""
-    import re, glob
-    rutas_dict = {}
+    """Encuentra ventas.csv y cualquier archivo de ventas adicional (ventas*.csv) ordenados."""
+    import glob
+    rutas = []
+    vistos = set()
     patrones = [
         os.path.join('data', 'ventas*.csv'),
         'ventas*.csv'
     ]
     for pat in patrones:
         for f in glob.glob(pat):
-            base = os.path.basename(f)
-            m = re.search(r'^ventas(?:_(\d+))?\.csv$', base, re.IGNORECASE)
-            if m:
-                idx = int(m.group(1)) if m.group(1) else 0
-                if idx not in rutas_dict:
-                    rutas_dict[idx] = f
-    return [rutas_dict[k] for k in sorted(rutas_dict.keys())]
+            f_norm = os.path.normpath(f)
+            base = os.path.basename(f).lower()
+            if base.endswith('.csv') and f_norm.lower() not in vistos:
+                vistos.add(f_norm.lower())
+                rutas.append(f_norm)
+    # Ordenar: ventas.csv primero, luego los demás alfabéticamente
+    rutas.sort(key=lambda x: (0 if os.path.basename(x).lower() == 'ventas.csv' else 1, x.lower()))
+    return rutas
 
 def obtener_rutas_tranzabilidad():
     """Encuentra tranzabilidad.csv y cualquier tranzabilidad_i.csv ordenados numéricamente."""
@@ -558,7 +560,7 @@ def cargar_datos_base(mtime_ventas=None, mtime_tranz=None, mtime_art=0.0, mtime_
     # 1. Ventas / Demanda Real / Análisis ABC (Fuente EXCLUSIVA: ventas.csv y ventas_i.csv)
     # NUNCA usar tranzabilidad.csv para ventas ni para análisis ABC
     rutas_ventas = obtener_rutas_ventas()
-    df_clean = pd.DataFrame(columns=['sku', 'fecha', 'nombre_trans', 'cantidad', 'total_venta', 'total_costo', 'costo_unit_trans'])
+    df_clean = pd.DataFrame(columns=['sku', 'fecha', 'nombre_trans', 'cantidad', 'total_venta', 'total_costo', 'costo_unit_trans', 'sucursal'])
     
     if rutas_ventas:
         dfs_ventas = []
@@ -572,6 +574,28 @@ def cargar_datos_base(mtime_ventas=None, mtime_tranz=None, mtime_art=0.0, mtime_
                     continue
             if df_temp is not None and not df_temp.empty:
                 df_temp.columns = [c.strip() for c in df_temp.columns]
+                
+                # Identificar columna clave 'Centro de Operaciones Empresa' para segmentar sedes
+                col_centro_f = None
+                for c in df_temp.columns:
+                    c_clean = c.strip().lower()
+                    if 'centro' in c_clean and ('operac' in c_clean or 'empresa' in c_clean) and 'cliente' not in c_clean:
+                        col_centro_f = c
+                        break
+                if not col_centro_f:
+                    for c in df_temp.columns:
+                        c_clean = c.strip().lower()
+                        if ('sucursal' in c_clean or 'tienda' in c_clean or 'sede' in c_clean) and 'cliente' not in c_clean:
+                            col_centro_f = c
+                            break
+
+                if col_centro_f and col_centro_f in df_temp.columns:
+                    df_temp['sucursal_raw'] = df_temp[col_centro_f].astype(str).str.strip()
+                else:
+                    base_nom = os.path.basename(r_v).rsplit('.', 1)[0]
+                    nom_sede = base_nom.replace('ventas_', '').replace('ventas', '006-Sede PGR 2023').strip()
+                    df_temp['sucursal_raw'] = nom_sede if nom_sede else '006-Sede PGR 2023'
+                    
                 dfs_ventas.append(df_temp)
                 
         df_trans = pd.concat(dfs_ventas, ignore_index=True) if dfs_ventas else pd.DataFrame()
@@ -613,6 +637,8 @@ def cargar_datos_base(mtime_ventas=None, mtime_tranz=None, mtime_art=0.0, mtime_
             
             df_clean = df_trans[cols_selected].copy()
             df_clean.columns = ['sku', 'fecha', 'nombre_trans', 'cantidad', 'total_venta', 'total_costo', 'costo_unit_trans']
+            df_clean['sucursal'] = df_trans['sucursal_raw'].apply(limpiar_mojibake).str.strip()
+            df_clean['sucursal'] = df_clean['sucursal'].replace({'': '006-Sede PGR 2023', '-': '006-Sede PGR 2023', 'nan': '006-Sede PGR 2023', 'None': '006-Sede PGR 2023'})
             df_clean['sku'] = df_clean['sku'].astype(str).str.strip()
             df_clean['cantidad'] = pd.to_numeric(df_clean['cantidad'].astype(str).str.replace(',', '', regex=False), errors='coerce').fillna(0.0)
             df_clean = df_clean[df_clean['cantidad'] > 0]  # Ventas efectivas únicamente
@@ -639,6 +665,7 @@ def cargar_datos_base(mtime_ventas=None, mtime_tranz=None, mtime_art=0.0, mtime_
             col_nom_trans = [c for c in df_trans.columns if 'ombre' in c and 'rt' in c][0]
             df_clean = df_trans[[col_art, col_fecha, col_nom_trans, 'Cantidad', 'Total', 'Total Costo', 'Costo Unitario']].copy()
             df_clean.columns = ['sku', 'fecha', 'nombre_trans', 'cantidad', 'total_venta', 'total_costo', 'costo_unit_trans']
+            df_clean['sucursal'] = '006-Sede PGR 2023'
             df_clean['sku'] = df_clean['sku'].astype(str).str.strip()
             df_clean['cantidad'] = pd.to_numeric(df_clean['cantidad'], errors='coerce').fillna(0.0)
             df_clean['total_venta'] = pd.to_numeric(df_clean['total_venta'].astype(str).str.replace(',', ''), errors='coerce').fillna(0.0)
@@ -647,7 +674,7 @@ def cargar_datos_base(mtime_ventas=None, mtime_tranz=None, mtime_art=0.0, mtime_
             df_clean['fecha'] = pd.to_datetime(df_clean['fecha'], format='mixed', dayfirst=True)
             df_clean = df_clean[df_clean['sku'] != 'MASS1575']
         else:
-            df_clean = pd.DataFrame(columns=['sku', 'fecha', 'nombre_trans', 'cantidad', 'total_venta', 'total_costo', 'costo_unit_trans'])
+            df_clean = pd.DataFrame(columns=['sku', 'fecha', 'nombre_trans', 'cantidad', 'total_venta', 'total_costo', 'costo_unit_trans', 'sucursal'])
     
     # 2. Historial de compras (FCO) y reposición neta histórica (FCO - DEC)
     # Extraído de tranzabilidad.csv si existe (ventas.csv solo contiene facturas de venta FVE)
@@ -921,6 +948,33 @@ with st.sidebar:
         
     st.divider()
     
+    st.subheader("Centro de Operaciones / Sedes")
+    sucursales_disp = sorted([
+        str(s).strip() for s in df_trans['sucursal'].dropna().unique() 
+        if str(s).strip() not in ['', 'nan', 'None', '-']
+    ])
+    if not sucursales_disp:
+        sucursales_disp = ['006-Sede PGR 2023']
+
+    sucursales_sel = st.multiselect(
+        "Centro de Operaciones Empresa:",
+        options=sucursales_disp,
+        default=sucursales_disp,
+        key="sidebar_sucursales_sel",
+        help="Segmenta las ventas por Centro de Operaciones Empresa. Por defecto incluye todas las sedes para calcular la Demanda Agregada Consolidada (visión tradicional para reposición de contenedores desde China)."
+    )
+    if not sucursales_sel:
+        st.warning("⚠️ Debes seleccionar al menos una sede. Se mantendrán todas seleccionadas.")
+        sucursales_sel = sucursales_disp
+
+    es_consolidado_total = (len(sucursales_sel) == len(sucursales_disp))
+    if es_consolidado_total:
+        st.success(f"🌐 **Demanda Agregada Consolidada** ({len(sucursales_disp)} sedes)")
+    else:
+        st.info(f"🏬 **Demanda Segmentada:** {len(sucursales_sel)} de {len(sucursales_disp)} sedes")
+
+    st.divider()
+    
     st.subheader("Ventana Temporal de Demanda")
     opcion_tiempo = st.selectbox(
         "Período analizado:",
@@ -970,6 +1024,9 @@ with st.sidebar:
             df_trans_filtrada = df_trans.copy()
     else:
         df_trans_filtrada = df_trans.copy()
+        
+    # Filtrar transacciones por Centro de Operaciones Empresa (Sedes seleccionadas)
+    df_trans_filtrada = df_trans_filtrada[df_trans_filtrada['sucursal'].isin(sucursales_sel)].copy()
         
     st.divider()
     st.subheader("Configuración de Abastecimiento")
@@ -1335,7 +1392,8 @@ def ejecutar_motor(df_t, _df_a, _df_m, _df_info, _df_transit, _df_fco, lt, flete
     
     return df_calc
 
-df_modelo = ejecutar_motor(df_trans_filtrada, df_art, df_metadata, df_info_prod, df_stock_transito, df_fco_ult, lead_time, flete_cbm, capacidad_cont, tasa_mant, costo_orden, factor_ss=factor_ss, _df_trans_global=df_trans, _engine_version="v6_cv_demanda_real")
+df_trans_activa = df_trans[df_trans['sucursal'].isin(sucursales_sel)].copy()
+df_modelo = ejecutar_motor(df_trans_filtrada, df_art, df_metadata, df_info_prod, df_stock_transito, df_fco_ult, lead_time, flete_cbm, capacidad_cont, tasa_mant, costo_orden, factor_ss=factor_ss, _df_trans_global=df_trans_activa, _engine_version="v6_cv_demanda_real")
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 4.5 DATOS BASE PARA VISTAS (Fichas Visuales y Matrices)
@@ -1361,11 +1419,20 @@ todas_categorias_catalogo = sorted(df_modelo['categoria'].dropna().unique().toli
 # ══════════════════════════════════════════════════════════════════════════════
 # 5. HEADER CORPORATIVO MASSHOPPING
 # ══════════════════════════════════════════════════════════════════════════════
-st.markdown("""
+badge_demanda_html = (
+    f'<div style="background: rgba(90, 160, 110, 0.25); color: #81C784; padding: 6px 14px; border-radius: 20px; font-weight: 700; font-size: 0.85rem; border: 1px solid rgba(129, 199, 132, 0.4); display: flex; align-items: center; gap: 6px;">🌐 Demanda Agregada Consolidada ({len(sucursales_disp)} Sedes)</div>'
+    if es_consolidado_total else
+    f'<div style="background: rgba(30, 136, 229, 0.25); color: #64B5F6; padding: 6px 14px; border-radius: 20px; font-weight: 700; font-size: 0.85rem; border: 1px solid rgba(100, 181, 246, 0.4); display: flex; align-items: center; gap: 6px;">🏬 Demanda Segmentada ({len(sucursales_sel)} de {len(sucursales_disp)} Sedes)</div>'
+)
+
+st.markdown(f"""
 <div class="masshopping-header">
     <div>
         <div class="masshopping-title">MASSHOPPING | Portal de Administracion y Planificacion Logistica</div>
-        <div class="masshopping-subtitle">Control de Inventarios - Clasificacion ABC-XYZ </div>
+        <div class="masshopping-subtitle">Control de Inventarios - Clasificacion ABC-XYZ</div>
+    </div>
+    <div>
+        {badge_demanda_html}
     </div>
 </div>
 """, unsafe_allow_html=True)
@@ -1669,7 +1736,8 @@ with tab3:
         fecha_min_global = df_trans['fecha'].min().date() if not df_trans.empty else datetime.date(2023,1,1)
         fecha_max_global = df_trans['fecha'].max().date() if not df_trans.empty else datetime.date(2026,12,31)
         
-        st.caption(f"Gráfico analítico de cantidades vendidas con impacto cambiario interdiario. Datos cargados hasta: **{fecha_max_global.strftime('%d/%m/%Y')}** ({len(df_trans):,} transacciones de venta).")
+        df_trans_activa = df_trans[df_trans['sucursal'].isin(sucursales_sel)]
+        st.caption(f"Gráfico analítico de cantidades vendidas con impacto cambiario interdiario. Datos cargados hasta: **{fecha_max_global.strftime('%d/%m/%Y')}** ({len(df_trans_activa):,} transacciones de venta activas).")
                 
         # Sincronizar automáticamente el rango del gráfico si la base de datos se actualizó con fechas más recientes
         if 'rango_grafico_tab3' in st.session_state:
@@ -1696,7 +1764,7 @@ with tab3:
                 key="rango_grafico_tab3"
             )
             
-        col_chk1, col_chk2, col_chk3, col_chk4 = st.columns(4)
+        col_chk1, col_chk2, col_chk3, col_chk4, col_chk5 = st.columns(5)
         with col_chk1:
             mostrar_tendencia = st.checkbox("Mostrar Tendencia", value=False)
         with col_chk2:
@@ -1705,20 +1773,22 @@ with tab3:
             mostrar_p2p = st.checkbox("Mostrar Variación USDT (P2P)", value=False)
         with col_chk4:
             mostrar_reposicion = st.checkbox("Mostrar Reposición (FCO - DEC)", value=False, help="Muestra compras netas efectivas (FCO - DEC)")
+        with col_chk5:
+            mostrar_desglose_sede = st.checkbox("Desglosar por Sede", value=False, help="Muestra la curva individual de cada Centro de Operaciones / Sede junto a la demanda agregada consolidada")
             
         is_mensual_chart = "Mensual" in freq_grafico
         freq_code = 'MS' if is_mensual_chart else 'W-MON'
         y_title_text = "Unidades Vendidas / Mes" if is_mensual_chart else "Unidades Vendidas / Semana"
         
-        # Apply local date filter to df_trans (full history)
-        df_plot_trans = df_trans
+        # Apply local date filter to df_trans (full history filtered by active branches)
+        df_plot_trans = df_trans[df_trans['sucursal'].isin(sucursales_sel)].copy()
         df_plot_repo = df_reposicion
         if isinstance(rango_local, tuple):
             if len(rango_local) == 2:
                 start_loc, end_loc = rango_local
-                df_plot_trans = df_trans[
-                    (df_trans['fecha'].dt.date >= start_loc) &
-                    (df_trans['fecha'].dt.date <= end_loc)
+                df_plot_trans = df_plot_trans[
+                    (df_plot_trans['fecha'].dt.date >= start_loc) &
+                    (df_plot_trans['fecha'].dt.date <= end_loc)
                 ]
                 if not df_reposicion.empty:
                     df_plot_repo = df_reposicion[
@@ -1727,8 +1797,8 @@ with tab3:
                     ]
             elif len(rango_local) == 1:
                 start_loc = rango_local[0]
-                df_plot_trans = df_trans[
-                    df_trans['fecha'].dt.date >= start_loc
+                df_plot_trans = df_plot_trans[
+                    df_plot_trans['fecha'].dt.date >= start_loc
                 ]
                 if not df_reposicion.empty:
                     df_plot_repo = df_reposicion[
@@ -1818,6 +1888,24 @@ with tab3:
                     hovertemplate="<b>Tendencia " + sku_code + "</b><br>Fecha: %{x|%b %Y}<br>Promedio móvil: <b>%{y:,.1f} uds</b><extra></extra>",
                     showlegend=True
                 ), secondary_y=False)
+
+            # Desglose opcional por Sede / Centro de Operaciones Empresa
+            if mostrar_desglose_sede and len(sucursales_sel) > 1:
+                paleta_sedes = ['#FF7043', '#AB47BC', '#26A69A', '#78909C', '#FFA726', '#8D6E63', '#4DD0E1', '#AED581']
+                for s_idx, sede_nom in enumerate(sucursales_sel):
+                    df_sede_sku = df_hist_sku[df_hist_sku['sucursal'] == sede_nom]
+                    if not df_sede_sku.empty:
+                        serie_sede = df_sede_sku.groupby(pd.Grouper(key='fecha', freq=freq_code))['cantidad'].sum().reset_index().sort_values('fecha')
+                        c_sede = paleta_sedes[s_idx % len(paleta_sedes)]
+                        lbl_sede = f"{sku_code} [{sede_nom}]" if len(skus_codigos) > 1 else f"Sede: {sede_nom}"
+                        fig.add_trace(go.Scatter(
+                            x=serie_sede['fecha'],
+                            y=serie_sede['cantidad'],
+                            mode='lines',
+                            name=lbl_sede,
+                            line=dict(width=1.5, color=c_sede, dash='dot'),
+                            hovertemplate="<b>" + sku_code + f" ({sede_nom})" + "</b><br>Fecha: %{x|%b %Y}<br>Cantidad: <b>%{y:,.0f} uds</b><extra></extra>"
+                        ), secondary_y=False)
         
         fig.update_layout(
             height=600,
@@ -2338,9 +2426,10 @@ with tab8:
     st.caption("Identifica productos que tienen stock disponible pero registran pocas o nulas ventas en los últimos 6 meses.")
     
     # ── 1. CÁLCULO DE VENTAS ACUMULADAS EN LOS ÚLTIMOS 6 MESES ──
-    fecha_max_t = df_trans['fecha'].max()
+    df_trans_activa_t8 = df_trans[df_trans['sucursal'].isin(sucursales_sel)]
+    fecha_max_t = df_trans_activa_t8['fecha'].max() if not df_trans_activa_t8.empty else df_trans['fecha'].max()
     fecha_limite_6m = fecha_max_t - pd.DateOffset(months=6)
-    df_trans_6m = df_trans[df_trans['fecha'] >= fecha_limite_6m]
+    df_trans_6m = df_trans_activa_t8[df_trans_activa_t8['fecha'] >= fecha_limite_6m]
     
     ventas_6m_df = df_trans_6m.groupby('sku')['cantidad'].sum().reset_index().rename(columns={'cantidad': 'ventas_6m'})
     
