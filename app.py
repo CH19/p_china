@@ -1007,7 +1007,7 @@ SKUS_IGNORAR_REPOSICION = set(
 )
 
 @st.cache_data
-def ejecutar_motor(df_t, _df_a, _df_m, _df_info, _df_transit, _df_fco, lt, flete, cap_cont, tasa, c_orden, lookback_months=None, factor_ss=0.0, _df_trans_global=None, _engine_version="v5_mensual_puro"):
+def ejecutar_motor(df_t, _df_a, _df_m, _df_info, _df_transit, _df_fco, lt, flete, cap_cont, tasa, c_orden, lookback_months=None, factor_ss=0.0, _df_trans_global=None, _engine_version="v6_cv_demanda_real"):
     lt = int(lt)
     # Lead Time mensual equivalente (3.5 meses para 15 semanas)
     lt_m = 3.5 if lt == 15 else round(lt / (52.0 / 12.0), 2)
@@ -1047,19 +1047,15 @@ def ejecutar_motor(df_t, _df_a, _df_m, _df_info, _df_transit, _df_fco, lt, flete
         if pd.notnull(f_prim):
             dias_hist = max(1, (fecha_max_global - f_prim).days)
             meses_hist = dias_hist / 30.44
-            
-            # Si el producto ya existía antes del inicio de la ventana analizada,
-            # no se deben recortar los ceros iniciales: son períodos reales de inactividad/agotado.
-            if f_prim <= fecha_min_ventana:
-                ts_trim_m = m_row
-            else:
-                # El producto nació genuinamente dentro de la ventana analizada (producto nuevo)
-                f_prim_mes = pd.Timestamp(f_prim.date()).replace(day=1)
-                col_indices = np.where(meses_cols >= f_prim_mes)[0]
-                first_idx = col_indices[0] if len(col_indices) > 0 else 0
-                ts_trim_m = m_row[first_idx:]
         else:
             meses_hist = float(len(m_row))
+            
+        # Delimitación del rango activo (Lógica Excel): desde la primera coincidencia con ventas (> 0) hasta la actualidad
+        indices_pos = np.where(m_row > 0)[0]
+        if len(indices_pos) > 0:
+            primera_fila = indices_pos[0]
+            ts_trim_m = m_row[primera_fila:]
+        else:
             ts_trim_m = m_row
             
         if m_row.sum() == 0 or len(ts_trim_m) == 0:
@@ -1083,21 +1079,26 @@ def ejecutar_motor(df_t, _df_a, _df_m, _df_info, _df_transit, _df_fco, lt, flete
             n_pos_m = len(pos_m)
             adi_m = n_per_m / n_pos_m if n_pos_m > 0 else float('inf')
             
-            # Clasificación Syntetos-Boylan mensual
+            # Coeficiente de Variación de la demanda dentro del rango de vida activo (incluye meses sin venta dentro de su ciclo activo)
+            mu_dem_tot = float(ts_win_slice.mean())
+            std_dem_tot = float(ts_win_slice.std(ddof=1)) if len(ts_win_slice) > 1 else 0.0
+            cv_dem_m = std_dem_tot / mu_dem_tot if mu_dem_tot > 0 else 0.0
+            
+            # Clasificación Syntetos-Boylan mensual (Croston para corrección SBA)
             if n_pos_m <= 1:
                 cuad_m = 'sin_datos'
-                cv2_m = np.nan
-                cv_m = np.nan
+                cv2_croston_m = np.nan
+                cv_croston_m = np.nan
             else:
                 mu_p_m = pos_m.mean()
                 std_p_m = pos_m.std(ddof=1)
-                cv_m = std_p_m / mu_p_m if mu_p_m > 0 else 0.0
-                cv2_m = cv_m ** 2
-                if adi_m < adi_umbral and cv2_m < cv2_umbral:
+                cv_croston_m = std_p_m / mu_p_m if mu_p_m > 0 else 0.0
+                cv2_croston_m = cv_croston_m ** 2
+                if adi_m < adi_umbral and cv2_croston_m < cv2_umbral:
                     cuad_m = 'smooth'
-                elif adi_m >= adi_umbral and cv2_m < cv2_umbral:
+                elif adi_m >= adi_umbral and cv2_croston_m < cv2_umbral:
                     cuad_m = 'intermittent'
-                elif adi_m < adi_umbral and cv2_m >= cv2_umbral:
+                elif adi_m < adi_umbral and cv2_croston_m >= cv2_umbral:
                     cuad_m = 'erratic'
                 else:
                     cuad_m = 'lumpy'
@@ -1127,8 +1128,8 @@ def ejecutar_motor(df_t, _df_a, _df_m, _df_info, _df_transit, _df_fco, lt, flete
                 mu_vel_m = mu_incond_m
                 
             # Corrección SBA para series intermitentes
-            if cuad_m == 'intermittent' and not np.isnan(cv2_m):
-                mu_sba_m = max(0.0, mu_vel_m * (1.0 - cv2_m / 2.0))
+            if cuad_m == 'intermittent' and not np.isnan(cv2_croston_m):
+                mu_sba_m = max(0.0, mu_vel_m * (1.0 - cv2_croston_m / 2.0))
             else:
                 mu_sba_m = mu_vel_m
                 
@@ -1183,8 +1184,9 @@ def ejecutar_motor(df_t, _df_a, _df_m, _df_info, _df_transit, _df_fco, lt, flete
                 'sku': sku,
                 'cuadrante': cuad_m,
                 'adi': adi_m,
-                'cv': cv_m if not np.isnan(cv_m) else 0.0,
-                'cv2': cv2_m if not np.isnan(cv2_m) else 0.0,
+                'cv': cv_dem_m,
+                'cv2': cv_dem_m ** 2,
+                'cv_croston': cv_croston_m if not np.isnan(cv_croston_m) else 0.0,
                 'n_pos': n_pos_m,
                 'meses_historial': meses_hist,
                 'demanda_mensual_prom': demanda_mensual_prom,
@@ -1203,8 +1205,8 @@ def ejecutar_motor(df_t, _df_a, _df_m, _df_info, _df_transit, _df_fco, lt, flete
                 # Aliases para compatibilidad transparente en todo el sistema
                 'cuadrante_mensual': cuad_m,
                 'adi_mensual': adi_m,
-                'cv_mensual': cv_m if not np.isnan(cv_m) else 0.0,
-                'cv2_mensual': cv2_m if not np.isnan(cv2_m) else 0.0,
+                'cv_mensual': cv_dem_m,
+                'cv2_mensual': cv_dem_m ** 2,
                 'mu_sba_mensual': mu_sba_m,
                 'demanda_esperada_lt_mensual': dem_lt_m,
                 'ss_empirico_mensual': ss_emp_m,
@@ -1337,7 +1339,7 @@ def ejecutar_motor(df_t, _df_a, _df_m, _df_info, _df_transit, _df_fco, lt, flete
     
     return df_calc
 
-df_modelo = ejecutar_motor(df_trans_filtrada, df_art, df_metadata, df_info_prod, df_stock_transito, df_fco_ult, lead_time, flete_cbm, capacidad_cont, tasa_mant, costo_orden, factor_ss=factor_ss, _df_trans_global=df_trans, _engine_version="v5_mensual_puro")
+df_modelo = ejecutar_motor(df_trans_filtrada, df_art, df_metadata, df_info_prod, df_stock_transito, df_fco_ult, lead_time, flete_cbm, capacidad_cont, tasa_mant, costo_orden, factor_ss=factor_ss, _df_trans_global=df_trans, _engine_version="v6_cv_demanda_real")
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 4.5 DATOS BASE PARA VISTAS (Fichas Visuales y Matrices)
@@ -1886,6 +1888,34 @@ with tab3:
             st.markdown("---")
             st.markdown("### Totales Agregados del Período Seleccionado")
             st.metric("Total Unidades Vendidas", f"{total_unidades:,.0f}")
+            
+            # ── TABLA DE DATOS ORIGINALES DE VENTAS DEL GRÁFICO ──
+            st.markdown("<br>", unsafe_allow_html=True)
+            st.subheader("📋 Registro Detallado de Ventas (Datos Base del Gráfico)")
+            st.caption(f"Detalle cronológico de las transacciones de venta efectivas con las que se calculan y grafican las cantidades ({len(df_plot_skus):,} registros en el período seleccionado).")
+            
+            df_ventas_grafico = df_plot_skus[['sku', 'fecha', 'cantidad', 'total_venta']].copy()
+            df_ventas_grafico = df_ventas_grafico.sort_values('fecha', ascending=False).reset_index(drop=True)
+            df_ventas_grafico.columns = ['Código', 'Fecha', 'Cantidad', 'Total ($)']
+            
+            st.dataframe(
+                df_ventas_grafico.style.format({
+                    'Fecha': lambda d: d.strftime('%d/%m/%Y %H:%M') if pd.notnull(d) else '',
+                    'Cantidad': '{:,.0f}',
+                    'Total ($)': '${:,.2f}'
+                }),
+                use_container_width=True,
+                height=350
+            )
+            
+            csv_ventas_graf = df_ventas_grafico.to_csv(index=False).encode('utf-8-sig')
+            st.download_button(
+                label="📥 Descargar Datos de Ventas (CSV)",
+                data=csv_ventas_graf,
+                file_name=f"ventas_grafico_{'_'.join(skus_codigos[:3])}.csv",
+                mime="text/csv",
+                key="btn_descarga_ventas_tab3"
+            )
         else:
             st.info("No hay datos de venta en el rango seleccionado para los productos elegidos.")
 
@@ -1986,7 +2016,8 @@ with tab5:
                 y=df_abc_chart[mask_clase]['total_ventas'],
                 name=f"Clase {clase}",
                 marker_color=color_map.get(clase),
-                hovertemplate="<b>%{x}</b><br>Clase: " + clase + "<br>Ventas Totales: $%{y:,.2f}<extra></extra>"
+                customdata=df_abc_chart[mask_clase]['total_unidades'],
+                hovertemplate="<b>%{x}</b><br>Clase: " + clase + "<br>Cantidad Vendida: <b>%{customdata:,.0f} uds</b><br>Ventas Totales: <b>$%{y:,.2f}</b><extra></extra>"
             ), secondary_y=False)
             
     fig_abc.add_trace(go.Scatter(
@@ -2021,9 +2052,11 @@ with tab5:
     * **Clase C (95% - 100%)**: Gran volumen de SKUs que aportan muy poco al ingreso total. Control flexible.
     """)
     
-    df_abc_table = df_abc[['sku', 'nombre', 'total_ventas', 'pct_acum', 'clase_abc']].copy()
+    df_abc_table = df_abc[['sku', 'nombre', 'total_unidades', 'total_ventas', 'pct_acum', 'clase_abc']].copy()
+    df_abc_table['total_unidades'] = df_abc_table['total_unidades'].fillna(0.0)
     df_abc_table['pct_venta'] = (df_abc_table['total_ventas'] / df_abc_table['total_ventas'].sum()) * 100
-    df_abc_table = df_abc_table[['sku', 'nombre', 'total_ventas', 'pct_venta', 'pct_acum', 'clase_abc']]
+    df_abc_table = df_abc_table[['sku', 'nombre', 'total_unidades', 'total_ventas', 'pct_venta', 'pct_acum', 'clase_abc']]
+    df_abc_table = df_abc_table.rename(columns={'total_unidades': 'cantidad_vendida'})
     
     search_abc = st.text_input("Buscar producto por código o nombre (ABC):", key="search_abc").strip().lower()
     if search_abc:
@@ -2039,6 +2072,7 @@ with tab5:
         
     st.dataframe(
         df_abc_table.style.format({
+            'cantidad_vendida': '{:,.0f}',
             'total_ventas': '${:,.2f}',
             'pct_venta': '{:.2f}%',
             'pct_acum': '{:.2f}%'
@@ -2051,10 +2085,13 @@ with tab5:
 # ══════════════════════════════════════════════════════════════════════════════
 with tab6:
     st.subheader("Dispersión XYZ (Demanda vs Variabilidad)")
-    st.caption("Identificación de productos estables (X), variables (Y) y erráticos (Z) según su demanda y volatilidad mensual.")
+    st.caption("Identificación de productos estables (X), variables (Y) y erráticos (Z) según su demanda y volatilidad mensual (excluyendo producto temporal MASS3063).")
+    
+    # Excluir producto temporal MASS3063
+    df_modelo_xyz = df_modelo[df_modelo['sku'] != 'MASS3063'].copy()
     
     fig_xyz = px.scatter(
-        df_modelo,
+        df_modelo_xyz,
         x='demanda_mensual_prom',
         y='cv',
         color='clase_xyz',
@@ -2085,7 +2122,7 @@ with tab6:
     * **Clase Z (CV > 1.0)**: Demanda errática o intermitente (Lumpy / Intermitente). Requieren mayor stock de seguridad o políticas bajo pedido.
     """)
     
-    df_xyz_table = df_modelo[['sku', 'nombre', 'demanda_mensual_prom', 'cv', 'clase_xyz']].copy()
+    df_xyz_table = df_modelo_xyz[['sku', 'nombre', 'demanda_mensual_prom', 'cv', 'clase_xyz']].copy()
     df_xyz_table = df_xyz_table.sort_values('cv', ascending=False).reset_index(drop=True)
     
     search_xyz = st.text_input("Buscar producto por código o nombre (XYZ):", key="search_xyz").strip().lower()
