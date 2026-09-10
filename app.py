@@ -957,21 +957,14 @@ with st.sidebar:
         sucursales_disp = ['006-Sede PGR 2023']
 
     sucursales_sel = st.multiselect(
-        "Centro de Operaciones Empresa:",
+        "Filtrar por Sede:",
         options=sucursales_disp,
         default=sucursales_disp,
         key="sidebar_sucursales_sel",
-        help="Segmenta las ventas por Centro de Operaciones Empresa. Por defecto incluye todas las sedes para calcular la Demanda Agregada Consolidada (visión tradicional para reposición de contenedores desde China)."
+        help="Permite segmentar las ventas por sede."
     )
     if not sucursales_sel:
-        st.warning("⚠️ Debes seleccionar al menos una sede. Se mantendrán todas seleccionadas.")
         sucursales_sel = sucursales_disp
-
-    es_consolidado_total = (len(sucursales_sel) == len(sucursales_disp))
-    if es_consolidado_total:
-        st.success(f"🌐 **Demanda Agregada Consolidada** ({len(sucursales_disp)} sedes)")
-    else:
-        st.info(f"🏬 **Demanda Segmentada:** {len(sucursales_sel)} de {len(sucursales_disp)} sedes")
 
     st.divider()
     
@@ -1419,20 +1412,11 @@ todas_categorias_catalogo = sorted(df_modelo['categoria'].dropna().unique().toli
 # ══════════════════════════════════════════════════════════════════════════════
 # 5. HEADER CORPORATIVO MASSHOPPING
 # ══════════════════════════════════════════════════════════════════════════════
-badge_demanda_html = (
-    f'<div style="background: rgba(90, 160, 110, 0.25); color: #81C784; padding: 6px 14px; border-radius: 20px; font-weight: 700; font-size: 0.85rem; border: 1px solid rgba(129, 199, 132, 0.4); display: flex; align-items: center; gap: 6px;">🌐 Demanda Agregada Consolidada ({len(sucursales_disp)} Sedes)</div>'
-    if es_consolidado_total else
-    f'<div style="background: rgba(30, 136, 229, 0.25); color: #64B5F6; padding: 6px 14px; border-radius: 20px; font-weight: 700; font-size: 0.85rem; border: 1px solid rgba(100, 181, 246, 0.4); display: flex; align-items: center; gap: 6px;">🏬 Demanda Segmentada ({len(sucursales_sel)} de {len(sucursales_disp)} Sedes)</div>'
-)
-
-st.markdown(f"""
+st.markdown("""
 <div class="masshopping-header">
     <div>
         <div class="masshopping-title">MASSHOPPING | Portal de Administracion y Planificacion Logistica</div>
         <div class="masshopping-subtitle">Control de Inventarios - Clasificacion ABC-XYZ</div>
-    </div>
-    <div>
-        {badge_demanda_html}
     </div>
 </div>
 """, unsafe_allow_html=True)
@@ -1690,40 +1674,75 @@ with tab3:
                 st.markdown(f"""
                 <div class="kpi-grid" style="grid-template-columns: repeat(3, 1fr);">
                     <div class="kpi-card">
-                        <div class="kpi-title">Stock Actual</div>
+                        <div class="kpi-title">Stock Actual <span title="Existencia física disponible actual en almacén (fuente: data/articulos.xlsx)." style="cursor:help; font-size:11px; color:#5AA06E; font-weight:700; border-radius:50%; border:1px solid #5AA06E; padding:0 4px; margin-left:3px;">?</span></div>
                         <div class="kpi-number">{item['stock_actual']:,.0f} unidades</div>
                     </div>
                     <div class="kpi-card">
-                        <div class="kpi-title">Stock en Tránsito</div>
+                        <div class="kpi-title">Stock en Tránsito <span title="Unidades de este SKU ya embarcadas o en tránsito en contenedores marítimos." style="cursor:help; font-size:11px; color:#5AA06E; font-weight:700; border-radius:50%; border:1px solid #5AA06E; padding:0 4px; margin-left:3px;">?</span></div>
                         <div class="kpi-number">{transit_val:,.0f} unidades</div>
                     </div>
                     <div class="kpi-card" style="border-top: 3px solid #1E88E5;">
-                        <div class="kpi-title" style="color:#1565C0;">Punto Reorden (ROP)</div>
+                        <div class="kpi-title" style="color:#1565C0;">Punto Reorden (ROP) <span title="Punto de Reorden: Nivel de inventario donde se debe emitir un nuevo pedido para no caer en quiebre durante el Lead Time." style="cursor:help; font-size:11px; color:#1E88E5; font-weight:700; border-radius:50%; border:1px solid #1E88E5; padding:0 4px; margin-left:3px;">?</span></div>
                         <div class="kpi-number" style="color:#1565C0;">{item['rop']:,.1f} unidades</div>
                     </div>
                     <div class="kpi-card">
-                        <div class="kpi-title">Estado Inventario</div>
+                        <div class="kpi-title">Estado Inventario <span title="REORDENAR si el stock disponible <= ROP; OK si el stock cubre la demanda." style="cursor:help; font-size:11px; color:#5AA06E; font-weight:700; border-radius:50%; border:1px solid #5AA06E; padding:0 4px; margin-left:3px;">?</span></div>
                         <div style="margin-top:2px;">{estado_html}</div>
                     </div>
                     <div class="kpi-card" style="border-top: 3px solid #1E88E5;">
-                        <div class="kpi-title" style="color:#1565C0;">Demanda Mensual</div>
+                        <div class="kpi-title" style="color:#1565C0;">Demanda Mensual <span title="Demanda promedio mensual calculada a partir de las ventas efectivas (FVE) en los meses activos." style="cursor:help; font-size:11px; color:#1E88E5; font-weight:700; border-radius:50%; border:1px solid #1E88E5; padding:0 4px; margin-left:3px;">?</span></div>
                         <div class="kpi-number" style="color:#1565C0;">{item['demanda_mensual_prom']:,.1f} uds/m</div>
                     </div>
                     <div class="kpi-card">
-                        <div class="kpi-title">Última Compra (FCO)</div>
+                        <div class="kpi-title">Última Compra (FCO) <span title="Fecha y cantidad de la última Factura de Compra (FCO) registrada en el sistema contable para este SKU. Permite auditar cuándo fue la última reposición física que ingresó al almacén." style="cursor:help; font-size:11px; color:#5AA06E; font-weight:700; border-radius:50%; border:1px solid #5AA06E; padding:0 4px; margin-left:3px;">?</span></div>
                         <div class="kpi-number" style="font-size:12px; font-weight:700; color:#141E32;">{item.get('estado_fco', 'N/A')}</div>
                     </div>
                     <div class="kpi-card">
-                        <div class="kpi-title">Historial / Vida</div>
+                        <div class="kpi-title">Historial / Vida <span title="Meses transcurridos desde la primera venta registrada de este producto hasta la actualidad. Permite contextualizar si un producto es nuevo en catálogo o maduro." style="cursor:help; font-size:11px; color:#5AA06E; font-weight:700; border-radius:50%; border:1px solid #5AA06E; padding:0 4px; margin-left:3px;">?</span></div>
                         <div class="kpi-number">{item['meses_historial']:.1f} meses</div>
                     </div>
                     <div class="kpi-card">
-                        <div class="kpi-title">Volatilidad (CV)</div>
+                        <div class="kpi-title">Volatilidad (CV) <span title="Coeficiente de Variación mensual (Desviación Estándar / Promedio). Mide la variabilidad o incertidumbre de las ventas (CV < 0.50 estable, CV >= 0.50 errático)." style="cursor:help; font-size:11px; color:#5AA06E; font-weight:700; border-radius:50%; border:1px solid #5AA06E; padding:0 4px; margin-left:3px;">?</span></div>
                         <div class="kpi-number">{cv_str}</div>
                     </div>
                     <div class="kpi-card">
-                        <div class="kpi-title">ADI | 1/ADI (Prob.)</div>
+                        <div class="kpi-title">ADI | 1/ADI (Prob.) <span title="ADI (Average Demand Interval): Intervalo promedio en meses entre ventas efectivas. Mide la intermitencia (ADI < 1.32 regular, ADI >= 1.32 intermitente). 1/ADI representa la probabilidad mensual de tener ventas." style="cursor:help; font-size:11px; color:#5AA06E; font-weight:700; border-radius:50%; border:1px solid #5AA06E; padding:0 4px; margin-left:3px;">?</span></div>
                         <div class="kpi-number">{adi_str} <span style="font-size:12.5px; font-weight:700; color:#2E7D32;">({prob_str})</span></div>
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
+
+            with st.expander("❓ ¿Qué significan ADI, Volatilidad (CV), Historial de Vida y Última Compra (FCO)?", expanded=False):
+                st.markdown("""
+                <div style="font-size: 13.5px; line-height: 1.6; color: #1E293B;">
+                    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 16px;">
+                        <div style="background: #F8FAFC; padding: 12px 16px; border-radius: 8px; border-left: 4px solid #5AA06E;">
+                            <h4 style="margin: 0 0 6px 0; color: #1E3A2F;">📌 ADI (Average Demand Interval)</h4>
+                            <p style="margin: 0 0 6px 0;"><b>¿Qué representa?</b> El intervalo promedio de meses que transcurren entre periodos con venta efectiva.</p>
+                            <ul style="margin: 0 0 6px 0; padding-left: 18px;">
+                                <li><b>ADI &lt; 1.32 (Demanda Frecuente / Continua):</b> El producto se vende casi todos los meses de forma regular.</li>
+                                <li><b>ADI &ge; 1.32 (Demanda Intermitente / Esporádica):</b> Pasan varios meses sin demanda entre compras.</li>
+                            </ul>
+                            <p style="margin: 0; color: #2E5B3D;"><b>1/ADI (Probabilidad):</b> Probabilidad porcentual estimada de registrar ventas en cualquier mes futuro.</p>
+                        </div>
+                        <div style="background: #F8FAFC; padding: 12px 16px; border-radius: 8px; border-left: 4px solid #1E88E5;">
+                            <h4 style="margin: 0 0 6px 0; color: #0D47A1;">📈 Volatilidad (CV - Coeficiente de Variación)</h4>
+                            <p style="margin: 0 0 6px 0;"><b>¿Qué representa?</b> La dispersión o grado de incertidumbre de la demanda mensual (Desviación Estándar &divide; Promedio Mensual).</p>
+                            <ul style="margin: 0; padding-left: 18px;">
+                                <li><b>CV &lt; 0.50 (Demanda Estable):</b> Ventas homogéneas, estables y de alta previsibilidad (Clase X).</li>
+                                <li><b>CV &ge; 0.50 (Demanda Volátil / Errática):</b> Ventas con fluctuaciones bruscas o picos estacionales (Clase Y / Z).</li>
+                            </ul>
+                        </div>
+                        <div style="background: #F8FAFC; padding: 12px 16px; border-radius: 8px; border-left: 4px solid #E65100;">
+                            <h4 style="margin: 0 0 6px 0; color: #BF360C;">⏳ Historial / Vida del Producto</h4>
+                            <p style="margin: 0 0 6px 0;"><b>¿Qué representa?</b> Meses transcurridos desde la <b>primera venta registrada</b> de este SKU hasta la actualidad.</p>
+                            <p style="margin: 0;"><b>Utilidad:</b> Evita subestimar productos nuevos (&lt; 6 meses en catálogo) calculando su demanda mensual sobre su ventana de vida real en lugar de promediar sobre años en los que el producto aún no existía.</p>
+                        </div>
+                        <div style="background: #F8FAFC; padding: 12px 16px; border-radius: 8px; border-left: 4px solid #7B1FA2;">
+                            <h4 style="margin: 0 0 6px 0; color: #4A148C;">📦 Última Compra (FCO - Factura de Compra)</h4>
+                            <p style="margin: 0 0 6px 0;"><b>¿Qué representa?</b> La fecha exacta y volumen de unidades recibidas en la última factura de compra o importación contable.</p>
+                            <p style="margin: 0;"><b>Utilidad:</b> Permite auditar cuándo fue la última reposición física que entró a almacén y cuánto tiempo ha operado el inventario desde el último lote recibido.</p>
+                        </div>
                     </div>
                 </div>
                 """, unsafe_allow_html=True)
@@ -1774,7 +1793,7 @@ with tab3:
         with col_chk4:
             mostrar_reposicion = st.checkbox("Mostrar Reposición (FCO - DEC)", value=False, help="Muestra compras netas efectivas (FCO - DEC)")
         with col_chk5:
-            mostrar_desglose_sede = st.checkbox("Desglosar por Sede", value=False, help="Muestra la curva individual de cada Centro de Operaciones / Sede junto a la demanda agregada consolidada")
+            mostrar_desglose_sede = st.checkbox("Desglosar por Sede", value=False, help="Muestra la curva individual de cada Centro de Operaciones / Sede junto a la demanda consolidada")
             
         is_mensual_chart = "Mensual" in freq_grafico
         freq_code = 'MS' if is_mensual_chart else 'W-MON'
