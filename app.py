@@ -1626,17 +1626,49 @@ with tab3:
         # 1. Ficha del Producto Principal (primer seleccionado)
         sku_principal = skus_codigos[0]
         item_df = df_modelo[df_modelo['sku'] == sku_principal]
+        sin_ventas_en_sede = False
         if len(item_df) > 0:
             item = item_df.iloc[0]
+        else:
+            sin_ventas_en_sede = True
+            art_match = df_art[df_art['sku'] == sku_principal]
+            nom_art = art_match['nombre'].values[0] if not art_match.empty else sku_principal
+            cat_art = art_match['categoria'].values[0] if not art_match.empty else 'General'
+            stk_art = art_match['stock_actual'].values[0] if not art_match.empty else 0.0
+            img_match = df_metadata[df_metadata['sku'] == sku_principal] if not df_metadata.empty else pd.DataFrame()
+            img_url = img_match['imagen_url'].values[0] if (not img_match.empty and 'imagen_url' in img_match.columns) else ''
+            item = pd.Series({
+                'sku': sku_principal,
+                'nombre': nom_art,
+                'categoria': cat_art,
+                'imagen_url': img_url,
+                'stock_actual': stk_art,
+                'stock_transito': 0.0,
+                'rop': 0.0,
+                'estado': 'OK',
+                'demanda_mensual_prom': 0.0,
+                'demanda_semanal_prom': 0.0,
+                'meses_historial': 0.0,
+                'cv': 0.0,
+                'adi': 0.0,
+                'clase_abc': 'C',
+                'clase_xyz': 'Z',
+                'clase_abc_xyz': 'C-Z',
+                'pct_ventas_total': 0.0,
+                'pct_ventas_acum': 0.0,
+                'estado_fco': 'Sin compras registradas'
+            })
             
-            st.divider()
-            col_img, col_info = st.columns([1, 2.2])
-            
-            with col_img:
-                if item['imagen_url'] and str(item['imagen_url']).startswith('http'):
-                    st.image(item['imagen_url'], caption=f"{item['sku']} | Masshopping Store", use_container_width=True)
-                else:
-                    st.info("Foto oficial no disponible en IMAGES.csv")
+        st.divider()
+        if sin_ventas_en_sede:
+            st.warning("⚠️ **Aviso:** Este producto no registra transacciones de ventas en la(s) sede(s) seleccionada(s) actualmente en la barra lateral.")
+        col_img, col_info = st.columns([1, 2.2])
+        
+        with col_img:
+            if item['imagen_url'] and str(item['imagen_url']).startswith('http'):
+                st.image(item['imagen_url'], caption=f"{item['sku']} | Masshopping Store", use_container_width=True)
+            else:
+                st.info("Foto oficial no disponible en IMAGES.csv")
             
             with col_info:
                 st.markdown(f"<h3 style='margin:0; color:#141E32;'>{item['nombre']}</h3>", unsafe_allow_html=True)
@@ -1859,8 +1891,12 @@ with tab3:
             serie = serie.sort_values('fecha')
             
             # Nombre para la leyenda
-            nombre_label = df_modelo[df_modelo['sku'] == sku_code]['nombre'].values
-            nombre_label = nombre_label[0] if len(nombre_label) > 0 else sku_code
+            nombre_matches = df_modelo[df_modelo['sku'] == sku_code]['nombre'].values
+            if len(nombre_matches) > 0:
+                nombre_label = nombre_matches[0]
+            else:
+                art_m = df_art[df_art['sku'] == sku_code]['nombre'].values
+                nombre_label = art_m[0] if len(art_m) > 0 else sku_code
             if len(nombre_label) > 30:
                 nombre_label = nombre_label[:30] + '...'
             legend_name = f"{sku_code} ({nombre_label})"
@@ -1880,7 +1916,10 @@ with tab3:
             
             # Métricas del modelo para rectas constantes de promedio
             sku_m = df_modelo[df_modelo['sku'] == sku_code]
-            prom_val = float(sku_m['demanda_mensual_prom'].values[0]) if is_mensual_chart else float(sku_m['demanda_semanal_prom'].values[0]) if not sku_m.empty else 0.0
+            if not sku_m.empty:
+                prom_val = float(sku_m['demanda_mensual_prom'].values[0]) if is_mensual_chart else float(sku_m['demanda_semanal_prom'].values[0])
+            else:
+                prom_val = 0.0
 
             # Linea constante de Demanda Promedio
             if mostrar_promedio and not serie.empty:
